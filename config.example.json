@@ -11,7 +11,10 @@
     {
       "user_id": "네이버아이디2",
       "password": "비밀번호2",
-      "keep_login": true
+      "keep_login": true,
+      "nid_aut": "",
+      "nid_ses": "",
+      "nid_jst": ""
     }
   ],
 
