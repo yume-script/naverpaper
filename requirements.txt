@@ -1,0 +1,5 @@
+aiohttp>=3.9.1
+beautifulsoup4>=4.12.2
+playwright>=1.52.0
+playwright-stealth>=2.0.3
+SQLAlchemy>=2.0.49

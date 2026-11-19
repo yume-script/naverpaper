@@ -1,0 +1,31 @@
+{
+  "accounts": [
+    {
+      "user_id": "네이버아이디1",
+      "password": "비밀번호1",
+      "keep_login": true,
+      "nid_aut": "",
+      "nid_ses": "",
+      "nid_jst": ""
+    },
+    {
+      "user_id": "네이버아이디2",
+      "password": "비밀번호2",
+      "keep_login": true
+    }
+  ],
+
+  "no_paper_record": true,
+  "keep_campaign_days": 60,
+  "keep_user_days": 7,
+
+  "proxy_url": "",
+  "proxy_reward_enabled": false,
+  "proxy_login_enabled": false,
+
+  "discord_webhook_url": "",
+  "discord_notify_mode": "always",
+  "discord_mask_ids": true,
+
+  "data_dir": ""
+}
