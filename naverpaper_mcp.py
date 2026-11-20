@@ -458,7 +458,11 @@ def _login_payload(user_id, result, entry, cfg):
         if cfg.get("discord_webhook_url"):
             try:
                 sent = nv.notify_captcha(
-                    cfg, user_id, image, f"naverpaper_login_submit 으로 {LOGIN_TIMEOUT_SECONDS // 60}분 안에 제출하세요."
+                    cfg,
+                    user_id,
+                    image,
+                    f"캡차 글자가 보이면 naverpaper_login_submit 으로 {LOGIN_TIMEOUT_SECONDS // 60}분 안에 제출하세요. 보이지 않으면 빈 문자열로 제출하면 다시 시도합니다.",
+                    status=str(result.get("msg") or ""),
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("캡차 이미지 디스코드 전송 실패")
@@ -495,6 +499,10 @@ def _login_start(account):
     try:
         account_obj = np.AccountConfig(user_id=user_id, password=target["password"], keep_login=target["keep_login"])
         result = np.open_login_screen_sync(account_obj, p["cookies"], cfg["login_proxy_url"], log=_engine_log)
+        if not result.get("cookies") and result.get("screenshot"):
+            # 처음 화면에는 캡차가 없으므로 아이디/비밀번호를 자동 입력해 먼저 로그인을 시도한다 (캡차는 시도 후에 나타남)
+            logger.info("로그인 화면을 열었습니다. 아이디/비밀번호를 자동 입력해 로그인을 시도합니다.")
+            result = np.submit_login_captcha_sync(user_id, "", p["cookies"], log=_engine_log)
     except Exception as e:  # noqa: BLE001
         logger.exception("로그인 화면 열기 실패")
         _login_cleanup(user_id)
@@ -584,7 +592,7 @@ async def naverpaper_notify(test: bool = False) -> dict:
 
 
 async def naverpaper_login_start(account: str):
-    """캡차 등으로 자동 로그인이 막힌 계정의 수동 로그인을 시작합니다. 캡차 이미지가 함께 반환되며 5분 안에 naverpaper_login_submit 으로 글자를 제출해야 합니다. account 는 naverpaper_status 의 index 번호 또는 마스킹된 아이디입니다."""
+    """캡차 등으로 자동 로그인이 막힌 계정의 수동 로그인을 시작합니다. 아이디/비밀번호를 자동 입력해 로그인을 시도하고, 캡차가 나타나면 그 화면 이미지를 함께 반환합니다(디스코드로도 전송). 캡차가 없으면 바로 로그인에 성공합니다. 5분 안에 naverpaper_login_submit 으로 글자를 제출해야 합니다. account 는 naverpaper_status 의 index 번호 또는 마스킹된 아이디입니다."""
     payload, image = await asyncio.to_thread(_login_start, account)
     return _with_image(payload, image)
 

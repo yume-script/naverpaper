@@ -354,13 +354,15 @@ def send_discord_image(webhook_url, payload, image_bytes, filename="captcha.png"
     return _discord_post(webhook_url, b"".join(parts), f"multipart/form-data; boundary={boundary}", retries)
 
 
-def notify_captcha(cfg, user_id, image_bytes, hint=""):
+def notify_captcha(cfg, user_id, image_bytes, hint="", status=""):
     """캡차 화면 이미지를 디스코드로 전송. 웹훅이 없으면 False."""
     url = cfg.get("discord_webhook_url")
     if not url or not image_bytes:
         return False
     name = _mask_id(user_id) if cfg.get("discord_mask_ids", True) else user_id
-    description = f"계정 **{name}**\n이미지에 보이는 캡차 글자를 입력해 주세요."
+    description = f"계정 **{name}**\n로그인을 시도한 뒤의 화면입니다. 이미지에 캡차 글자가 보이면 입력해 주세요."
+    if status:
+        description += f"\n상태: {status}"
     if hint:
         description += f"\n{hint}"
     payload = {
@@ -616,6 +618,11 @@ def cmd_login(np, cfg, args):
         log = lambda m: logger.info("%s", m)  # noqa: E731
 
         result = np.open_login_screen_sync(account, cookie_dir, cfg["login_proxy_url"], log=log)
+        if not result.get("cookies") and result.get("screenshot"):
+            # 처음 열린 로그인 화면에는 캡차가 없다(캡차는 로그인을 시도한 뒤에 나타남).
+            # 그래서 아이디/비밀번호를 자동 입력해 먼저 로그인을 시도하고, 캡차가 나오면 그 화면을 보여 준다.
+            print("아이디/비밀번호를 자동 입력해 로그인을 시도합니다...")
+            result = np.submit_login_captcha_sync(target["user_id"], "", cookie_dir, log=log)
         for attempt in range(3):
             if result.get("cookies"):
                 logger.info("로그인 성공: 쿠키 저장 완료 (%s)", target["user_id"])
@@ -631,7 +638,13 @@ def cmd_login(np, cfg, args):
                 _save_screenshot(shot, path)
                 print(f"\n로그인 화면 캡처: {path}")
                 if cfg["discord_webhook_url"]:
-                    sent = notify_captcha(cfg, target["user_id"], _shot_bytes(shot), "이 터미널의 입력창에 글자를 입력하세요.")
+                    sent = notify_captcha(
+                        cfg,
+                        target["user_id"],
+                        _shot_bytes(shot),
+                        "캡차 글자가 보이면 이 터미널의 입력창에 입력하세요. 보이지 않으면 그냥 Enter(빈 입력)로 다시 시도합니다.",
+                        status=result.get("msg") or "",
+                    )
                     print("캡차 이미지를 디스코드로 전송했습니다." if sent else "디스코드 전송에 실패했습니다 (로그 확인).")
             if not sys.stdin.isatty():
                 logger.error("터미널(TTY)이 아니라 캡차를 입력할 수 없습니다. 터미널에서 직접 실행하세요.")
