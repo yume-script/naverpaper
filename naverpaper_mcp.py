@@ -15,7 +15,7 @@
 
 실행 예
   # LiteLLM 연결용 (streamable HTTP) - 토큰은 config.json 의 mcp_token 에서 읽음
-  python3 naverpaper_mcp.py --host 0.0.0.0 --port 8765
+  python3 naverpaper_mcp.py --host 0.0.0.0 --port 5934
   # 로컬 stdio
   python3 naverpaper_mcp.py --transport stdio
 
@@ -420,17 +420,25 @@ def _login_payload(user_id, result, entry, cfg):
     shot = result.get("screenshot")
     if shot and entry["attempts"] < MAX_LOGIN_ATTEMPTS:
         _arm_timer(user_id, entry)
-        return (
-            {
-                "status": "captcha_required",
-                "account": _mask(user_id),
-                "attempt": entry["attempts"] + 1,
-                "max_attempts": MAX_LOGIN_ATTEMPTS,
-                "expires_in_seconds": LOGIN_TIMEOUT_SECONDS,
-                "message": _scrub(result.get("msg") or "캡차 이미지를 확인하고 naverpaper_login_submit 으로 글자를 제출하세요.", cfg),
-            },
-            _decode_shot(shot),
-        )
+        image = _decode_shot(shot)
+        payload = {
+            "status": "captcha_required",
+            "account": _mask(user_id),
+            "attempt": entry["attempts"] + 1,
+            "max_attempts": MAX_LOGIN_ATTEMPTS,
+            "expires_in_seconds": LOGIN_TIMEOUT_SECONDS,
+            "message": _scrub(result.get("msg") or "캡차 이미지를 확인하고 naverpaper_login_submit 으로 글자를 제출하세요.", cfg),
+        }
+        if cfg.get("discord_webhook_url"):
+            try:
+                sent = nv.notify_captcha(
+                    cfg, user_id, image, f"naverpaper_login_submit 으로 {LOGIN_TIMEOUT_SECONDS // 60}분 안에 제출하세요."
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("캡차 이미지 디스코드 전송 실패")
+                sent = False
+            payload["discord_sent"] = bool(sent)
+        return payload, image
     _login_cleanup(user_id)
     return {"status": "failed", "account": _mask(user_id), "message": _scrub(result.get("msg") or "로그인에 실패했습니다.", cfg)}, None
 
@@ -668,10 +676,10 @@ def main():
     parser = argparse.ArgumentParser(description="naverpaper MCP 서버")
     parser.add_argument("--transport", choices=["streamable-http", "sse", "stdio"], default="streamable-http")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=5934)
     parser.add_argument("-c", "--config", default=os.environ.get("NAVERPAPER_CONFIG") or nv.DEFAULT_CONFIG)
     parser.add_argument("--token", default="", help="인증 토큰 (기본: 환경변수 NAVERPAPER_MCP_TOKEN, 없으면 config.json 의 mcp_token)")
-    parser.add_argument("--allowed-host", action="append", default=[], help="허용할 Host 헤더 (예: 192.168.0.10:8765), 여러 번 지정 가능")
+    parser.add_argument("--allowed-host", action="append", default=[], help="허용할 Host 헤더 (예: 192.168.0.10:5934), 여러 번 지정 가능")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 

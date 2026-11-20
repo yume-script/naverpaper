@@ -168,10 +168,14 @@ python3 naverpaper.py -v             # 자세한 로그
 비밀번호 자동 로그인이 캡차 등으로 막히면 터미널에서 직접 실행하세요(cron 불가).
 
 ```bash
-python3 naverpaper.py login 아이디
+./venv/bin/python naverpaper.py login 아이디
 ```
 
-로그인 화면이 `data/login_아이디.png` 로 저장됩니다. 이미지를 보고 캡차 문자를 입력하면 쿠키가 저장되고, 이후 cron 실행에서는 저장된 쿠키를 씁니다.
+로그인 화면이 `data/login_아이디.png` 로 저장되고, **디스코드 웹훅이 설정되어 있으면 같은 이미지가 디스코드(스레드 포함)로 전송됩니다.** 휴대폰의 디스코드에서 캡차 글자를 확인한 뒤 터미널에 입력하세요. 틀리면 새 캡차가 다시 전송되며 최대 3회까지 시도합니다.
+
+- 웹훅은 보내기 전용이라 디스코드에서 답장을 써도 서버로 전달되지 않습니다. 글자는 터미널(또는 MCP의 `naverpaper_login_submit`)로 입력해야 합니다.
+- 전송되는 이미지는 로그인 화면 캡처이므로 아이디 입력칸이 보일 수 있습니다. 개인용 스레드/채널에만 보내세요.
+- MCP의 `naverpaper_login_start`/`naverpaper_login_submit` 도 같은 이미지를 디스코드로 보내고, 응답에 `discord_sent` 로 전송 여부를 알려 줍니다.
 
 ---
 
@@ -281,25 +285,25 @@ chmod 600 /mnt/naverpaper/config.json
 ### 실행
 
 ```bash
-python3 naverpaper_mcp.py --host 0.0.0.0 --port 8765
+python3 naverpaper_mcp.py --host 0.0.0.0 --port 5934
 ```
 
 | 옵션 | 설명 |
 | --- | --- |
 | `--transport` | `streamable-http`(기본) / `sse` / `stdio` |
-| `--host`, `--port` | 기본 `127.0.0.1:8765`. 로컬이 아닌 주소에 바인딩하면 **토큰이 없을 때 시작을 거부**합니다 |
+| `--host`, `--port` | 기본 `127.0.0.1:5934`. 로컬이 아닌 주소에 바인딩하면 **토큰이 없을 때 시작을 거부**합니다 |
 | `--token` | 인증 토큰 (위 우선순위 참고) |
-| `--allowed-host` | Host 헤더 검사를 켜고 허용 호스트를 지정 (예: `192.168.0.10:8765`, 여러 번 지정 가능) |
+| `--allowed-host` | Host 헤더 검사를 켜고 허용 호스트를 지정 (예: `192.168.0.10:5934`, 여러 번 지정 가능) |
 | `-c`, `--config` | 설정 파일 경로 (환경변수 `NAVERPAPER_CONFIG`) |
 
-인증은 `Authorization: Bearer <토큰>` 또는 `X-API-Key: <토큰>` 헤더를 받습니다. 접속 주소는 `http://호스트:8765/mcp` 입니다. 설정 파일을 고친 뒤에는 MCP 서버를 재시작해야 새 토큰이 적용됩니다.
+인증은 `Authorization: Bearer <토큰>` 또는 `X-API-Key: <토큰>` 헤더를 받습니다. 접속 주소는 `http://호스트:5934/mcp` 입니다. 설정 파일을 고친 뒤에는 MCP 서버를 재시작해야 새 토큰이 적용됩니다.
 
 ### LiteLLM 설정 (`config.yaml`)
 
 ```yaml
 mcp_servers:
   naverpaper:
-    url: "http://서버IP:8765/mcp"
+    url: "http://서버IP:5934/mcp"
     transport: "http"
     auth_type: "bearer_token"
     auth_value: os.environ/NAVERPAPER_MCP_TOKEN
@@ -309,7 +313,7 @@ mcp_servers:
 - LiteLLM은 `naverpaper`의 `config.json`을 읽지 못하므로, **같은 토큰 값**을 LiteLLM 쪽에도 따로 넣어야 합니다. 환경변수 `NAVERPAPER_MCP_TOKEN`으로 넘기거나 `auth_value`에 값을 직접 적으세요. (이 환경변수는 LiteLLM 프로세스용이며 naverpaper 서버는 `config.json`에서 읽습니다.)
 - LiteLLM이 도커 컨테이너라면 `서버IP` 자리에 호스트의 사설 IP(또는 `host.docker.internal`)를 쓰세요. `127.0.0.1` 은 컨테이너 자신을 가리킵니다.
 - LiteLLM은 도구 이름 앞에 서버 이름(`naverpaper`)을 붙여 보여줄 수 있습니다. LiteLLM UI의 MCP Servers 화면에서 실제 노출 이름을 확인하세요.
-- `421 Invalid Host header` 오류가 나면 `--allowed-host 서버IP:8765` 를 추가하세요.
+- `421 Invalid Host header` 오류가 나면 `--allowed-host 서버IP:5934` 를 추가하세요.
 
 ### systemd 등록 (상시 실행)
 
@@ -321,7 +325,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=/mnt/naverpaper
-ExecStart=/mnt/naverpaper/venv/bin/python /mnt/naverpaper/naverpaper_mcp.py --host 0.0.0.0 --port 8765
+ExecStart=/mnt/naverpaper/venv/bin/python /mnt/naverpaper/naverpaper_mcp.py --host 0.0.0.0 --port 5934
 Restart=on-failure
 RestartSec=5
 
@@ -340,7 +344,7 @@ journalctl -u naverpaper-mcp -f
 ### 보안 주의
 
 - 비밀번호, 쿠키 값, 웹훅 주소는 어떤 도구도 돌려주지 않으며 로그 조회 시에도 가립니다. 계정 아이디는 마스킹됩니다.
-- 이 서버는 수집 실행과 로그인을 시킬 수 있습니다. 방화벽(`ufw` 등)으로 8765 포트를 LiteLLM 서버 IP에서만 접근하도록 제한하고, 인터넷에 직접 노출하지 마세요.
+- 이 서버는 수집 실행과 로그인을 시킬 수 있습니다. 방화벽(`ufw` 등)으로 5934 포트를 LiteLLM 서버 IP에서만 접근하도록 제한하고, 인터넷에 직접 노출하지 마세요.
 - cron 수집과 MCP 실행은 같은 파일 락을 써서 겹치지 않습니다. 겹치면 MCP는 "건너뜀"으로 응답하고 cron은 종료 코드 2로 끝납니다.
 - 캡차 로그인 중에는 락을 잡고 있어 수집이 시작되지 않습니다. 5분이 지나면 세션이 자동으로 닫히고 락이 풀립니다.
 

@@ -23,6 +23,7 @@ import os
 import sys
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -289,37 +290,36 @@ def _mask_id(user_id):
     return (user_id[:3] if len(user_id) > 3 else user_id[:1]) + "•••"
 
 
-def send_discord(webhook_url, payload, retries=2):
-    """웹훅 전송. 성공 True. (토큰이 들어 있으므로 URL 은 로그에 남기지 않는다)"""
+def _discord_post(webhook_url, body, content_type, retries=2):
+    """웹훅 POST 공통 처리 (429 재시도). 성공 True. 토큰이 들어 있으므로 URL 은 로그에 남기지 않는다."""
     import urllib.error
     import urllib.request
 
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     for attempt in range(retries + 1):
         req = urllib.request.Request(
             webhook_url,
-            data=data,
+            data=body,
             method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": "naverpaper/1.0"},
+            headers={"Content-Type": content_type, "User-Agent": "naverpaper/1.0"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 return 200 <= resp.status < 300
         except urllib.error.HTTPError as e:
-            body = ""
+            err = ""
             try:
-                body = e.read().decode("utf-8", "replace")
+                err = e.read().decode("utf-8", "replace")
             except Exception:
                 pass
             if e.code == 429 and attempt < retries:
                 wait = 1.0
                 try:
-                    wait = float(json.loads(body).get("retry_after", 1.0))
+                    wait = float(json.loads(err).get("retry_after", 1.0))
                 except Exception:
                     pass
                 time.sleep(min(wait, 30))
                 continue
-            logger.error("디스코드 전송 실패 HTTP %s: %s", e.code, body[:200])
+            logger.error("디스코드 전송 실패 HTTP %s: %s", e.code, err[:200])
             return False
         except Exception as e:
             logger.error("디스코드 전송 실패: %s", e)
@@ -328,6 +328,54 @@ def send_discord(webhook_url, payload, retries=2):
                 continue
             return False
     return False
+
+
+def send_discord(webhook_url, payload, retries=2):
+    """JSON 메시지 전송."""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return _discord_post(webhook_url, data, "application/json", retries)
+
+
+def send_discord_image(webhook_url, payload, image_bytes, filename="captcha.png", retries=2):
+    """이미지 첨부 전송 (multipart). payload 는 payload_json 으로 함께 보낸다."""
+    boundary = "----naverpaper" + uuid.uuid4().hex
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
+        f"Content-Type: application/json\r\n\r\n".encode("utf-8"),
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        b"\r\n",
+        f'--{boundary}\r\nContent-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'
+        f"Content-Type: image/png\r\n\r\n".encode("utf-8"),
+        image_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode("utf-8"),
+    ]
+    return _discord_post(webhook_url, b"".join(parts), f"multipart/form-data; boundary={boundary}", retries)
+
+
+def notify_captcha(cfg, user_id, image_bytes, hint=""):
+    """캡차 화면 이미지를 디스코드로 전송. 웹훅이 없으면 False."""
+    url = cfg.get("discord_webhook_url")
+    if not url or not image_bytes:
+        return False
+    name = _mask_id(user_id) if cfg.get("discord_mask_ids", True) else user_id
+    description = f"계정 **{name}**\n이미지에 보이는 캡차 글자를 입력해 주세요."
+    if hint:
+        description += f"\n{hint}"
+    payload = {
+        "embeds": [
+            {
+                "title": "네이버 로그인 캡차",
+                "description": description,
+                "color": 0xF1C40F,
+                "image": {"url": "attachment://captcha.png"},
+                "footer": {"text": "naverpaper"},
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            }
+        ],
+        "attachments": [{"id": 0, "filename": "captcha.png"}],
+    }
+    return send_discord_image(url, payload, image_bytes, "captcha.png")
 
 
 def build_embed(cfg, title, stats, run_points=None, error_message=""):
@@ -481,10 +529,14 @@ def cmd_status(np, cfg, args):
     return EXIT_OK
 
 
-def _save_screenshot(data_url, path):
+def _shot_bytes(data_url):
     raw = data_url.split(",", 1)[1] if "," in data_url else data_url
+    return base64.b64decode(raw)
+
+
+def _save_screenshot(data_url, path):
     with open(path, "wb") as f:
-        f.write(base64.b64decode(raw))
+        f.write(_shot_bytes(data_url))
 
 
 def cmd_login(np, cfg, args):
@@ -520,6 +572,9 @@ def cmd_login(np, cfg, args):
                 path = os.path.join(cfg["data_dir"], f"login_{target['user_id']}.png")
                 _save_screenshot(shot, path)
                 print(f"\n로그인 화면 캡처: {path}")
+                if cfg["discord_webhook_url"]:
+                    sent = notify_captcha(cfg, target["user_id"], _shot_bytes(shot), "이 터미널의 입력창에 글자를 입력하세요.")
+                    print("캡차 이미지를 디스코드로 전송했습니다." if sent else "디스코드 전송에 실패했습니다 (로그 확인).")
             if not sys.stdin.isatty():
                 logger.error("터미널(TTY)이 아니라 캡차를 입력할 수 없습니다. 터미널에서 직접 실행하세요.")
                 np.close_login_session_sync(target["user_id"])
