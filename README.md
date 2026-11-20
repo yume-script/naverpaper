@@ -7,6 +7,7 @@ flaskfarm 플러그인 [`ff_naverpaper`](https://gitlab.com/sukajds/ff_naverpape
 - 실행마다 이번 적립 금액과 계정별 누적 합계 출력
 - 디스코드 웹훅(스레드 지정 가능)으로 결과 전송
 - 캡차로 자동 로그인이 막힐 때 터미널에서 수동 로그인
+- MCP 서버(`naverpaper_mcp.py`): LiteLLM 등에서 `naverpaper_` 도구로 조회·실행
 
 ---
 
@@ -231,7 +232,111 @@ idB                          3         3         3           8
 
 ---
 
-## 7. 문제 해결
+## 7. MCP 서버 (LiteLLM 연결)
+
+`naverpaper_mcp.py` 는 수집 기능을 MCP 도구로 노출합니다. 도구 이름은 모두 `naverpaper_` 로 시작합니다. 수집 엔진은 건드리지 않고 `naverpaper.py` 의 함수를 그대로 재사용합니다.
+
+### 도구 목록
+
+| 도구 | 설명 |
+| --- | --- |
+| `naverpaper_status` | 계정별 쿠키 상태 (아이디 마스킹, `index` 번호 제공) |
+| `naverpaper_totals` | 오늘/7일/30일/전체 적립 합계 + 최근 실행 내역 (`runs`: 1~50) |
+| `naverpaper_run` | 수집을 **백그라운드로 시작**하고 즉시 반환 |
+| `naverpaper_link` | 링크 하나 수동 적립 (백그라운드, 적립 가능한 https 리워드 링크만 허용) |
+| `naverpaper_run_status` | 진행 중인 작업 상태와 결과 + DB에 기록된 마지막 실행 |
+| `naverpaper_logs` | 로그 마지막 N줄 (1~300, 쿠키·웹훅·비밀번호는 가림) |
+| `naverpaper_notify` | 적립 합계를 디스코드로 전송 (`test=true`: 테스트 메시지) |
+| `naverpaper_login_start` | 캡차 수동 로그인 시작, **캡차 이미지를 함께 반환** (5분 유효) |
+| `naverpaper_login_submit` | 캡차 글자 제출 (최대 3회) |
+
+수집은 몇 분 걸릴 수 있어 `naverpaper_run` / `naverpaper_link` 는 바로 반환하고, 결과는 `naverpaper_run_status` 로 확인합니다. `account` 인자에는 `naverpaper_status` 의 `index` 번호나 마스킹된 아이디(`abc•••`)를 쓰면 됩니다.
+
+### 설치
+
+```bash
+cd /mnt/naverpaper
+source venv/bin/activate
+pip install -r requirements-mcp.txt
+```
+
+### 실행
+
+토큰은 환경변수로 넘기는 것을 권장합니다 (`ps` 에 노출되지 않음).
+
+```bash
+export NAVERPAPER_MCP_TOKEN='긴-랜덤-문자열'    # 예: openssl rand -hex 32
+python3 naverpaper_mcp.py --host 0.0.0.0 --port 8765
+```
+
+| 옵션 | 설명 |
+| --- | --- |
+| `--transport` | `streamable-http`(기본) / `sse` / `stdio` |
+| `--host`, `--port` | 기본 `127.0.0.1:8765`. 로컬이 아닌 주소에 바인딩하면 **토큰이 없을 때 시작을 거부**합니다 |
+| `--token` | 인증 토큰 (환경변수 `NAVERPAPER_MCP_TOKEN` 이 기본) |
+| `--allowed-host` | Host 헤더 검사를 켜고 허용 호스트를 지정 (예: `192.168.0.10:8765`, 여러 번 지정 가능) |
+| `-c`, `--config` | 설정 파일 경로 (환경변수 `NAVERPAPER_CONFIG`) |
+
+인증은 `Authorization: Bearer <토큰>` 또는 `X-API-Key: <토큰>` 헤더를 받습니다. 접속 주소는 `http://호스트:8765/mcp` 입니다.
+
+### LiteLLM 설정 (`config.yaml`)
+
+```yaml
+mcp_servers:
+  naverpaper:
+    url: "http://서버IP:8765/mcp"
+    transport: "http"
+    auth_type: "bearer_token"
+    auth_value: os.environ/NAVERPAPER_MCP_TOKEN
+    description: "네이버 폐지줍기 관리"
+```
+
+- LiteLLM 프로세스에도 같은 값의 환경변수 `NAVERPAPER_MCP_TOKEN` 을 설정하세요.
+- LiteLLM이 도커 컨테이너라면 `서버IP` 자리에 호스트의 사설 IP(또는 `host.docker.internal`)를 쓰세요. `127.0.0.1` 은 컨테이너 자신을 가리킵니다.
+- LiteLLM은 도구 이름 앞에 서버 이름(`naverpaper`)을 붙여 보여줄 수 있습니다. LiteLLM UI의 MCP Servers 화면에서 실제 노출 이름을 확인하세요.
+- `421 Invalid Host header` 오류가 나면 `--allowed-host 서버IP:8765` 를 추가하세요.
+
+### systemd 등록 (상시 실행)
+
+`/etc/naverpaper-mcp.env` (권한 600)
+```
+NAVERPAPER_MCP_TOKEN=긴-랜덤-문자열
+```
+
+`/etc/systemd/system/naverpaper-mcp.service`
+```ini
+[Unit]
+Description=naverpaper MCP server
+After=network-online.target
+
+[Service]
+WorkingDirectory=/mnt/naverpaper
+EnvironmentFile=/etc/naverpaper-mcp.env
+ExecStart=/mnt/naverpaper/venv/bin/python /mnt/naverpaper/naverpaper_mcp.py --host 0.0.0.0 --port 8765
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo chmod 600 /etc/naverpaper-mcp.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now naverpaper-mcp
+journalctl -u naverpaper-mcp -f
+```
+
+### 보안 주의
+
+- 비밀번호, 쿠키 값, 웹훅 주소는 어떤 도구도 돌려주지 않으며 로그 조회 시에도 가립니다. 계정 아이디는 마스킹됩니다.
+- 이 서버는 수집 실행과 로그인을 시킬 수 있습니다. 방화벽(`ufw` 등)으로 8765 포트를 LiteLLM 서버 IP에서만 접근하도록 제한하고, 인터넷에 직접 노출하지 마세요.
+- cron 수집과 MCP 실행은 같은 파일 락을 써서 겹치지 않습니다. 겹치면 MCP는 "건너뜀"으로 응답하고 cron은 종료 코드 2로 끝납니다.
+- 캡차 로그인 중에는 락을 잡고 있어 수집이 시작되지 않습니다. 5분이 지나면 세션이 자동으로 닫히고 락이 풀립니다.
+
+---
+
+## 8. 문제 해결
 
 | 증상 | 확인 |
 | --- | --- |
@@ -240,4 +345,6 @@ idB                          3         3         3           8
 | 계정이 NG 로 나오고 로그인이 안 됨 | `python3 naverpaper.py login 아이디` 로 수동 로그인 |
 | 종료 코드 2 | 이전 수집이 아직 실행 중이라 건너뜀. 정상 동작 |
 | 디스코드로 안 옴 | `notify --test` 실행 후 로그의 HTTP 상태 확인 (404: 주소 또는 thread_id 오류, 401: 토큰 오류) |
+| MCP: LiteLLM 에서 연결 실패 | 서버 주소/포트, 방화벽, 토큰 일치 여부 확인. 컨테이너라면 `127.0.0.1` 대신 호스트 IP 사용. `journalctl -u naverpaper-mcp` 확인 |
+| MCP: `421 Invalid Host header` | `--allowed-host 서버IP:포트` 추가 |
 | cron 에서만 실패 | cron 줄에서 `cd` 와 `./venv/bin/python` 경로 확인, `/mnt` 마운트 상태 확인 |
