@@ -255,10 +255,12 @@ idB                          3         3         3           8
 
 ### 설치
 
+MCP용 패키지(`mcp`, `uvicorn`)도 `requirements.txt` 하나에 들어 있습니다. 이미 설치해 둔 환경이라면 다시 설치해서 추가하세요.
+
 ```bash
 cd /mnt/naverpaper
 source venv/bin/activate
-pip install -r requirements-mcp.txt
+pip install -r requirements.txt
 ```
 
 ### 토큰 설정

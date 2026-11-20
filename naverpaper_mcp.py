@@ -691,7 +691,7 @@ def main():
     try:
         mcp = build_server(args.host, args.port, args.allowed_host)
     except ImportError as e:
-        print(f"[패키지 오류] {e}\npip install -r requirements-mcp.txt", file=sys.stderr)
+        print(f"[패키지 오류] {e}\npip install -r requirements.txt", file=sys.stderr)
         return nv.EXIT_CONFIG
 
     logger.info("naverpaper MCP 시작 transport=%s host=%s port=%s auth=%s", args.transport, args.host, args.port, "token" if token else "none")
