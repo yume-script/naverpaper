@@ -100,6 +100,7 @@ def load_config(path):
         "discord_webhook_url": webhook,
         "discord_notify_mode": notify_mode,
         "discord_mask_ids": _to_bool(cfg.get("discord_mask_ids"), True),
+        "mcp_token": str(cfg.get("mcp_token") or "").strip(),
     }
 
 

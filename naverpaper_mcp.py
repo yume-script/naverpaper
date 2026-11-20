@@ -14,8 +14,8 @@
   naverpaper_login_submit  캡차 글자 제출
 
 실행 예
-  # LiteLLM 연결용 (streamable HTTP)
-  NAVERPAPER_MCP_TOKEN=긴-랜덤-문자열 python3 naverpaper_mcp.py --host 0.0.0.0 --port 8765
+  # LiteLLM 연결용 (streamable HTTP) - 토큰은 config.json 의 mcp_token 에서 읽음
+  python3 naverpaper_mcp.py --host 0.0.0.0 --port 8765
   # 로컬 stdio
   python3 naverpaper_mcp.py --transport stdio
 
@@ -670,7 +670,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("-c", "--config", default=os.environ.get("NAVERPAPER_CONFIG") or nv.DEFAULT_CONFIG)
-    parser.add_argument("--token", default="", help="인증 토큰 (환경변수 NAVERPAPER_MCP_TOKEN 권장)")
+    parser.add_argument("--token", default="", help="인증 토큰 (기본: 환경변수 NAVERPAPER_MCP_TOKEN, 없으면 config.json 의 mcp_token)")
     parser.add_argument("--allowed-host", action="append", default=[], help="허용할 Host 헤더 (예: 192.168.0.10:8765), 여러 번 지정 가능")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -683,9 +683,9 @@ def main():
         return nv.EXIT_CONFIG
     _setup_logging(cfg["data_dir"], args.verbose)
 
-    token = args.token or os.environ.get("NAVERPAPER_MCP_TOKEN", "")
+    token = args.token or os.environ.get("NAVERPAPER_MCP_TOKEN", "") or cfg.get("mcp_token", "")
     if args.transport != "stdio" and args.host not in LOOPBACK_HOSTS and not token:
-        print("[설정 오류] 외부 주소에 바인딩하려면 토큰이 필요합니다 (NAVERPAPER_MCP_TOKEN 환경변수 또는 --token).", file=sys.stderr)
+        print("[설정 오류] 외부 주소에 바인딩하려면 토큰이 필요합니다 (config.json 의 mcp_token, 환경변수 NAVERPAPER_MCP_TOKEN 또는 --token).", file=sys.stderr)
         return nv.EXIT_CONFIG
 
     try:

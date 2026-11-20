@@ -27,5 +27,7 @@
   "discord_notify_mode": "always",
   "discord_mask_ids": true,
 
+  "mcp_token": "",
+
   "data_dir": ""
 }

@@ -142,6 +142,7 @@ pip install -r requirements.txt     # 의존성이 바뀌었을 때만
 | discord_webhook_url | 디스코드 웹훅 주소 (아래 참고) |
 | discord_notify_mode | `always` 매번 전송 / `earned` 적립이 있거나 오류일 때만 전송 |
 | discord_mask_ids | true 면 아이디를 앞 3글자만 표시 (`abc•••`) |
+| mcp_token | MCP 서버(`naverpaper_mcp.py`) 인증 토큰. 외부 주소에 바인딩하면 필수 (7장 참고) |
 | data_dir | 쿠키·DB·로그 저장 위치 (비우면 `./data`) |
 
 ---
@@ -260,12 +261,24 @@ source venv/bin/activate
 pip install -r requirements-mcp.txt
 ```
 
-### 실행
+### 토큰 설정
 
-토큰은 환경변수로 넘기는 것을 권장합니다 (`ps` 에 노출되지 않음).
+`config.json`에 토큰을 넣습니다. 이 파일은 비밀번호도 담고 있으므로 권한을 600으로 유지하세요.
 
 ```bash
-export NAVERPAPER_MCP_TOKEN='긴-랜덤-문자열'    # 예: openssl rand -hex 32
+openssl rand -hex 32        # 토큰 생성
+nano /mnt/naverpaper/config.json
+chmod 600 /mnt/naverpaper/config.json
+```
+```json
+"mcp_token": "생성한-긴-랜덤-문자열",
+```
+
+토큰은 `--token` 옵션 > 환경변수 `NAVERPAPER_MCP_TOKEN` > `config.json`의 `mcp_token` 순서로 찾습니다. 설정 파일에 넣어 두면 별도의 환경 파일이 필요 없습니다.
+
+### 실행
+
+```bash
 python3 naverpaper_mcp.py --host 0.0.0.0 --port 8765
 ```
 
@@ -273,11 +286,11 @@ python3 naverpaper_mcp.py --host 0.0.0.0 --port 8765
 | --- | --- |
 | `--transport` | `streamable-http`(기본) / `sse` / `stdio` |
 | `--host`, `--port` | 기본 `127.0.0.1:8765`. 로컬이 아닌 주소에 바인딩하면 **토큰이 없을 때 시작을 거부**합니다 |
-| `--token` | 인증 토큰 (환경변수 `NAVERPAPER_MCP_TOKEN` 이 기본) |
+| `--token` | 인증 토큰 (위 우선순위 참고) |
 | `--allowed-host` | Host 헤더 검사를 켜고 허용 호스트를 지정 (예: `192.168.0.10:8765`, 여러 번 지정 가능) |
 | `-c`, `--config` | 설정 파일 경로 (환경변수 `NAVERPAPER_CONFIG`) |
 
-인증은 `Authorization: Bearer <토큰>` 또는 `X-API-Key: <토큰>` 헤더를 받습니다. 접속 주소는 `http://호스트:8765/mcp` 입니다.
+인증은 `Authorization: Bearer <토큰>` 또는 `X-API-Key: <토큰>` 헤더를 받습니다. 접속 주소는 `http://호스트:8765/mcp` 입니다. 설정 파일을 고친 뒤에는 MCP 서버를 재시작해야 새 토큰이 적용됩니다.
 
 ### LiteLLM 설정 (`config.yaml`)
 
@@ -291,17 +304,12 @@ mcp_servers:
     description: "네이버 폐지줍기 관리"
 ```
 
-- LiteLLM 프로세스에도 같은 값의 환경변수 `NAVERPAPER_MCP_TOKEN` 을 설정하세요.
+- LiteLLM은 `naverpaper`의 `config.json`을 읽지 못하므로, **같은 토큰 값**을 LiteLLM 쪽에도 따로 넣어야 합니다. 환경변수 `NAVERPAPER_MCP_TOKEN`으로 넘기거나 `auth_value`에 값을 직접 적으세요. (이 환경변수는 LiteLLM 프로세스용이며 naverpaper 서버는 `config.json`에서 읽습니다.)
 - LiteLLM이 도커 컨테이너라면 `서버IP` 자리에 호스트의 사설 IP(또는 `host.docker.internal`)를 쓰세요. `127.0.0.1` 은 컨테이너 자신을 가리킵니다.
 - LiteLLM은 도구 이름 앞에 서버 이름(`naverpaper`)을 붙여 보여줄 수 있습니다. LiteLLM UI의 MCP Servers 화면에서 실제 노출 이름을 확인하세요.
 - `421 Invalid Host header` 오류가 나면 `--allowed-host 서버IP:8765` 를 추가하세요.
 
 ### systemd 등록 (상시 실행)
-
-`/etc/naverpaper-mcp.env` (권한 600)
-```
-NAVERPAPER_MCP_TOKEN=긴-랜덤-문자열
-```
 
 `/etc/systemd/system/naverpaper-mcp.service`
 ```ini
@@ -311,7 +319,6 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=/mnt/naverpaper
-EnvironmentFile=/etc/naverpaper-mcp.env
 ExecStart=/mnt/naverpaper/venv/bin/python /mnt/naverpaper/naverpaper_mcp.py --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=5
@@ -320,8 +327,9 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
+토큰은 `config.json`에서 읽으므로 환경 파일이 필요 없습니다.
+
 ```bash
-sudo chmod 600 /etc/naverpaper-mcp.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now naverpaper-mcp
 journalctl -u naverpaper-mcp -f
