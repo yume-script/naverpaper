@@ -279,6 +279,7 @@ async def run(config: RunConfig, log: Optional[Callable[[str], None]] = None) ->
         if log:
             log(message)
 
+    reset_session_events()
     with db.get_session() as session_db:
         history = RunHistory(started_at=result.started_at, status="running", account_count=result.account_count)
         session_db.add(history)
@@ -314,6 +315,7 @@ async def run(config: RunConfig, log: Optional[Callable[[str], None]] = None) ->
                     account_candidate_urls,
                     excluded_reward_sources,
                 )
+                _apply_session_events(account_result)
                 result.account_results.append(account_result)
                 result.estimated_points += account_result.estimated_points
                 result.skipped_url_count += account_result.skipped_url_count
@@ -396,6 +398,7 @@ async def run_manual_link(
         result.message = "manual link is empty"
         return result
 
+    reset_session_events()
     with db.get_session() as session_db:
         history = RunHistory(started_at=result.started_at, status="running", account_count=result.account_count, collected_url_count=1)
         session_db.add(history)
@@ -414,6 +417,7 @@ async def run_manual_link(
                     emit,
                     login_proxy_url,
                 )
+                _apply_session_events(account_result)
                 result.account_results.append(account_result)
                 result.estimated_points += account_result.estimated_points
                 result.skipped_url_count += account_result.skipped_url_count
@@ -488,6 +492,9 @@ class AccountResult:
     skipped_url_count: int = 0
     estimated_points: int = 0
     details: list[DetailResult] = field(default_factory=list)
+    session_expired: bool = False  # 네이버 서버에서 세션이 무효화됨 (재로그인까지 실패한 경우 포함)
+    login_failed: bool = False  # 로그인 자체에 실패
+    relogin: str = ""  # 자동 재로그인 결과: "", "ok", "failed", "skipped"
 
 
 def cookie_path(cookie_dir: str, nid: str) -> str:
@@ -855,6 +862,173 @@ async def ensure_cookie_storage_state(
 
     emit(f"{account.user_id}: cookie auto refresh failed - {refresh_message}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# 세션 만료 감지 / 자동 재로그인
+#
+# 쿠키 파일의 만료일이 남아 있어도 네이버가 서버에서 세션을 무효화하면 네이버페이 페이지가
+# nid.naver.com 로그인 화면으로 이동한다. 이 상태에서 링크를 처리하면 적립 없이 "방문 기록"만
+# 남아, 로그인을 복구해도 그 링크를 다시 시도하지 않게 된다. 그래서 만료를 감지하면 링크 처리를
+# 중단(방문 기록 저장 안 함)하고 저장된 비밀번호로 재로그인을 시도한다.
+# ---------------------------------------------------------------------------
+LOGIN_REDIRECT_RE = re.compile(r"nid\.naver\.com/[^\s]*login", re.I)
+RELOGIN_COOLDOWN_SECONDS = 1800
+_SESSION_EVENTS: dict = {}
+
+
+def is_login_redirect(url) -> bool:
+    """주소(또는 주소가 들어 있는 문구)가 네이버 로그인 화면이면 True."""
+    return bool(LOGIN_REDIRECT_RE.search(str(url or "")))
+
+
+def reset_session_events():
+    _SESSION_EVENTS.clear()
+
+
+def session_event(user_id) -> dict:
+    return dict(_SESSION_EVENTS.get(str(user_id or ""), {}))
+
+
+def note_session_event(user_id, **values):
+    _SESSION_EVENTS.setdefault(str(user_id or ""), {}).update(values)
+
+
+def _apply_session_events(account_result):
+    ev = session_event(account_result.user_id)
+    if ev.get("relogin"):
+        account_result.relogin = ev["relogin"]
+    if ev.get("expired") and ev.get("relogin") != "ok":
+        account_result.session_expired = True
+
+
+def _relogin_marker(cookie_dir: str, user_id: str) -> str:
+    return os.path.join(cookie_dir, f"{user_id}.relogin")
+
+
+async def force_relogin(account: AccountConfig, session_db, cookie_dir: str, proxy_url: str, emit: Callable[[str], None]):
+    """세션이 서버에서 무효화된 경우: 저장된 쿠키·프로필 쿠키를 믿지 않고 비밀번호로 새 세션을 만든다."""
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+
+    if not account.password:
+        return False, "password empty"
+    os.makedirs(cookie_dir, exist_ok=True)
+    profile_dir = browser_profile_dir(cookie_dir, account.user_id)
+    os.makedirs(profile_dir, exist_ok=True)
+
+    # 무효가 된 쿠키는 더 이상 쓰지 않는다 (실패해도 status 가 NG 로 보이도록 먼저 지운다)
+    try:
+        os.remove(cookie_path(cookie_dir, account.user_id))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        emit(f"{account.user_id}: could not remove stale cookie file - {e}")
+    try:
+        session_db.query(User).filter_by(user_id=account.user_id).update({"storage_state": ""})
+    except Exception as e:
+        emit(f"{account.user_id}: could not clear stored session - {e}")
+
+    async with async_playwright() as playwright:
+        launch_kwargs = {
+            "headless": True,
+            "user_agent": IPHONE13_UA,
+            "viewport": {"width": 390, "height": 844},
+            "device_scale_factor": 3,
+            "is_mobile": True,
+            "has_touch": True,
+        }
+        proxy = playwright_proxy(proxy_url)
+        if proxy:
+            launch_kwargs["proxy"] = proxy
+        context = await playwright.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await Stealth().apply_stealth_async(page)
+            await context.clear_cookies()  # 프로필에 남은 무효 쿠키 제거
+            login_ok, login_message = await password_login_on_page(page, account, emit)
+            if not login_ok:
+                return False, login_message
+            storage = await context.storage_state()
+            ok, message = check_storage_data_status(storage)
+            if not ok:
+                return False, message
+            save_storage_state(cookie_dir, account.user_id, storage)
+            session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(storage), updated_at=datetime.now()))
+            return True, message
+        finally:
+            await context.close()
+
+
+async def repair_expired_session(account: AccountConfig, session_db, cookie_dir: str, proxy_url: str, emit: Callable[[str], None]) -> bool:
+    """세션 만료 시 재로그인을 시도한다. 한 번의 실행에서는 계정당 한 번만, 30분 이내 재시도는 건너뛴다."""
+    uid = account.user_id
+    ev = session_event(uid)
+    if ev.get("relogin"):
+        return ev["relogin"] == "ok"
+
+    marker = _relogin_marker(cookie_dir, uid)
+    try:
+        if time.time() - os.path.getmtime(marker) < RELOGIN_COOLDOWN_SECONDS:
+            emit(f"{uid}: session expired; re-login skipped (tried within the last {RELOGIN_COOLDOWN_SECONDS // 60} min)")
+            note_session_event(uid, expired=True, relogin="skipped", message="cooldown")
+            return False
+    except OSError:
+        pass
+
+    emit(f"{uid}: session expired; forcing re-login with the saved password")
+    try:
+        os.makedirs(cookie_dir, exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except OSError:
+        pass
+    try:
+        ok, message = await force_relogin(account, session_db, cookie_dir, proxy_url, emit)
+    except Exception as e:
+        ok, message = False, str(e)
+    note_session_event(uid, expired=True, relogin="ok" if ok else "failed", message=str(message)[:200])
+    emit(f"{uid}: re-login {'succeeded' if ok else 'failed'} ({message})")
+    return ok
+
+
+async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_url: str = "", emit: Optional[Callable[[str], None]] = None):
+    """저장된 쿠키로 네이버페이에 실제 접속해 로그인 상태를 확인한다. (state, detail) — state: alive / expired / unknown"""
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+
+    ok, message = check_cookie_status(account.user_id, cookie_dir)
+    if not ok:
+        return "expired", f"cookie file: {message}"
+    async with async_playwright() as playwright:
+        launch_kwargs = {"headless": True}
+        proxy = playwright_proxy(reward_proxy_url)
+        if proxy:
+            launch_kwargs["proxy"] = proxy
+        browser = await playwright.chromium.launch(**launch_kwargs)
+        try:
+            context = await browser.new_context(
+                user_agent=IPHONE13_UA,
+                viewport={"width": 390, "height": 844},
+                device_scale_factor=3,
+                is_mobile=True,
+                has_touch=True,
+                storage_state=cookie_path(cookie_dir, account.user_id),
+            )
+            page = await context.new_page()
+            await Stealth().apply_stealth_async(page)
+            points = await get_naverpay_point_balance(page)
+            if is_login_redirect(page.url):
+                return "expired", "redirected to login (server-side session is no longer valid)"
+            if points is None:
+                return "unknown", "point balance unreadable (page did not load as expected)"
+            return "alive", f"logged in (point balance {points})"
+        finally:
+            await browser.close()
+
+
+def verify_session_sync(account: AccountConfig, cookie_dir: str, reward_proxy_url: str = "", log: Optional[Callable[[str], None]] = None):
+    return _run_async_in_thread(lambda: verify_session(account, cookie_dir, reward_proxy_url, log))
 
 
 def _run_async(coro):
@@ -2147,6 +2321,10 @@ async def process_campaign_links(page, campaign_links, session_db, user_id: str,
                 detail.url = link
             else:
                 detail = await visit_campaign_url(page, link, session_db, user_id, emit, excluded_reward_sources)
+            if is_login_redirect(page.url) or is_login_redirect(getattr(detail, "message", "")):
+                emit(f"{user_id}: session expired while processing (redirected to login); stopping and NOT recording as visited: {link}")
+                details.append(DetailResult(user_id=user_id, url=link, status="login_error", message="session expired during run"))
+                break
             if is_reward_url(link) and not should_revisit_url(link):
                 existing_visit = session_db.query(UrlVisit).filter_by(url=link, user_id=user_id).first()
                 if not existing_visit:
@@ -2219,50 +2397,86 @@ async def process_account(
     if not campaign_links:
         return result
 
+    # 수집 단계에서 세션 만료가 확인됐고 재로그인도 실패한 경우: 링크를 처리하면 방문 기록만 남으므로 건너뛴다
+    ev = session_event(account.user_id)
+    if ev.get("expired") and ev.get("relogin") in ("failed", "skipped"):
+        emit(f"{account.user_id}: session expired and re-login failed; leaving {len(campaign_links)} link(s) unvisited (not recorded)")
+        result.session_expired = True
+        result.relogin = ev.get("relogin", "")
+        result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="session expired; re-login failed"))
+        return result
+
     storage_state = await ensure_cookie_storage_state(account, session_db, cookie_dir, login_proxy_url, emit)
     if not storage_state:
+        result.login_failed = True
         result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="cookie auto refresh failed"))
         return result
     os.makedirs(cookie_dir, exist_ok=True)
     async with async_playwright() as playwright:
-        launch_kwargs = {"headless": True}
-        proxy = playwright_proxy(reward_proxy_url)
-        if proxy:
-            launch_kwargs["proxy"] = proxy
-        browser = await playwright.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
-            user_agent=IPHONE13_UA,
-            viewport={"width": 390, "height": 844},
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True,
-            storage_state=storage_state,
-        )
-        page = await context.new_page()
-        await Stealth().apply_stealth_async(page)
+        for attempt in (1, 2):
+            launch_kwargs = {"headless": True}
+            proxy = playwright_proxy(reward_proxy_url)
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+            browser = await playwright.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(
+                user_agent=IPHONE13_UA,
+                viewport={"width": 390, "height": 844},
+                device_scale_factor=3,
+                is_mobile=True,
+                has_touch=True,
+                storage_state=storage_state,
+            )
+            page = await context.new_page()
+            await Stealth().apply_stealth_async(page)
 
-        login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
-        if login_ok:
-            before_points = await get_naverpay_point_balance(page)
-            details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
-            after_points = await get_naverpay_point_balance(page)
-            result.details.extend(details)
-            result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
-            result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url")])
-            if before_points is not None and after_points is not None:
-                result.estimated_points = max(0, after_points - before_points)
-                emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
-            else:
-                result.estimated_points = 0
-            new_storage = await context.storage_state()
-            session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
-            with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
-                json.dump(new_storage, f, ensure_ascii=False, indent=2)
-        else:
-            result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
-        await context.close()
-        await browser.close()
+            expired = False
+            try:
+                login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
+                if not login_ok:
+                    result.login_failed = True
+                    result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
+                else:
+                    before_points = await get_naverpay_point_balance(page)
+                    if is_login_redirect(page.url):
+                        # 쿠키 파일은 유효해 보여도 서버에서 세션이 무효화된 상태
+                        emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
+                        note_session_event(account.user_id, expired=True)
+                        expired = True
+                    else:
+                        if before_points is None:
+                            emit(f"{account.user_id}: point balance unavailable before run (could not read the balance)")
+                        details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
+                        after_points = await get_naverpay_point_balance(page)
+                        result.details.extend(details)
+                        result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
+                        result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
+                        if before_points is not None and after_points is not None:
+                            result.estimated_points = max(0, after_points - before_points)
+                            emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
+                        else:
+                            result.estimated_points = 0
+                        if any(x.status == "login_error" for x in details):
+                            result.session_expired = True
+                            note_session_event(account.user_id, expired=True)
+                        else:
+                            new_storage = await context.storage_state()
+                            session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
+                            with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
+                                json.dump(new_storage, f, ensure_ascii=False, indent=2)
+            finally:
+                await context.close()
+                await browser.close()
 
+            if expired:
+                if attempt == 1 and await repair_expired_session(account, session_db, cookie_dir, login_proxy_url, emit):
+                    storage_state = get_storage_state(account.user_id, session_db, cookie_dir)
+                    continue  # 새 세션으로 한 번 더 시도
+                result.session_expired = True
+                result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="session expired; re-login failed"))
+            break
+
+    result.relogin = session_event(account.user_id).get("relogin", "")
     return result
 
 
@@ -2290,6 +2504,7 @@ async def process_account_manual_link(
     link: str,
     emit: Callable[[str], None],
     login_proxy_url: str = "",
+    _retried: bool = False,
 ) -> AccountResult:
     from playwright.async_api import async_playwright
     from playwright_stealth import Stealth
@@ -2298,9 +2513,11 @@ async def process_account_manual_link(
     result.target_url_count = 1
     storage_state = await ensure_cookie_storage_state(account, session_db, cookie_dir, login_proxy_url, emit)
     if not storage_state:
-        result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="cookie auto refresh failed"))
+        result.login_failed = True
+        result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message="cookie auto refresh failed"))
         return result
     os.makedirs(cookie_dir, exist_ok=True)
+    expired = False
     async with async_playwright() as playwright:
         launch_kwargs = {"headless": True}
         proxy = playwright_proxy(reward_proxy_url)
@@ -2321,25 +2538,41 @@ async def process_account_manual_link(
         login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
         if login_ok:
             before_points = await get_naverpay_point_balance(page)
-            details = await process_campaign_links(page, [link], session_db, account.user_id, emit)
-            after_points = await get_naverpay_point_balance(page)
-            result.details.extend(details)
-            result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
-            result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url")])
-            if before_points is not None and after_points is not None:
-                result.estimated_points = max(0, after_points - before_points)
-                emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
+            if is_login_redirect(page.url):
+                emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
+                note_session_event(account.user_id, expired=True)
+                expired = True
             else:
-                result.estimated_points = 0
-            new_storage = await context.storage_state()
-            session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
-            with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
-                json.dump(new_storage, f, ensure_ascii=False, indent=2)
+                details = await process_campaign_links(page, [link], session_db, account.user_id, emit)
+                after_points = await get_naverpay_point_balance(page)
+                result.details.extend(details)
+                result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
+                result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
+                if before_points is not None and after_points is not None:
+                    result.estimated_points = max(0, after_points - before_points)
+                    emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
+                else:
+                    result.estimated_points = 0
+                if any(x.status == "login_error" for x in details):
+                    result.session_expired = True
+                    note_session_event(account.user_id, expired=True)
+                else:
+                    new_storage = await context.storage_state()
+                    session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
+                    with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
+                        json.dump(new_storage, f, ensure_ascii=False, indent=2)
         else:
+            result.login_failed = True
             result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message=login_message))
         await context.close()
         await browser.close()
 
+    if expired:
+        if not _retried and await repair_expired_session(account, session_db, cookie_dir, login_proxy_url, emit):
+            return await process_account_manual_link(account, session_db, cookie_dir, reward_proxy_url, link, emit, login_proxy_url, _retried=True)
+        result.session_expired = True
+        result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message="session expired; re-login failed"))
+    result.relogin = session_event(account.user_id).get("relogin", "")
     return result
 
 
@@ -2724,6 +2957,10 @@ async def process_naverpay_point_main(
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(8000)
+            if is_login_redirect(page.url):
+                emit(f"{account.user_id}: session expired (point main redirected to login)")
+                note_session_event(account.user_id, expired=True)
+                return
             body_text = await page.locator("body").inner_text(timeout=5000)
             if "로그인" in body_text[:500] and "포인트" not in body_text[:500]:
                 return
@@ -2790,6 +3027,10 @@ async def process_naverpay_mission_detail_source(
             emit(f"naverpay mission detail page loading for {account.user_id}")
             await page.goto(NAVERPAY_MISSION_DETAIL_URL, wait_until="domcontentloaded", timeout=30000)
             emit(f"naverpay mission detail page loaded for {account.user_id}: {page.url}")
+            if is_login_redirect(page.url):
+                emit(f"{account.user_id}: session expired (mission page redirected to login)")
+                note_session_event(account.user_id, expired=True)
+                return
             await page.wait_for_timeout(3000)
             await collect_lazy_page_content(page)
             emit(f"naverpay mission detail lazy content collected for {account.user_id}")
@@ -3073,24 +3314,36 @@ async def save_naver_campaign_urls(
         ("https://damoang.net/economy", process_damoang_url),
     ]
     collector_account = (accounts or [None])[0]
+
+    async def collect_mission_source():
+        account_urls = set()
+        emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({collector_account.user_id}) started")
+        await process_naverpay_mission_detail_source(
+            collector_account,
+            session_db,
+            cookie_dir,
+            account_urls,
+            emit,
+            reward_proxy_url,
+            login_proxy_url,
+            source_resolutions,
+        )
+        add_collected_for_account(collector_account.user_id, account_urls)
+        emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({collector_account.user_id}): +{len(account_urls)}")
+
     if collector_account:
         try:
-            account_urls = set()
-            emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({collector_account.user_id}) started")
-            await process_naverpay_mission_detail_source(
-                collector_account,
-                session_db,
-                cookie_dir,
-                account_urls,
-                emit,
-                reward_proxy_url,
-                login_proxy_url,
-                source_resolutions,
-            )
-            add_collected_for_account(collector_account.user_id, account_urls)
-            emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({collector_account.user_id}): +{len(account_urls)}")
+            await collect_mission_source()
         except Exception as e:
             emit(f"{NAVERPAY_MISSION_DETAIL_URL}: collection error for {collector_account.user_id} - {e}")
+        # 세션이 만료되어 미션 페이지가 로그인 화면으로 이동했다면: 재로그인 후 이 소스만 한 번 다시 수집
+        collector_event = session_event(collector_account.user_id)
+        if collector_event.get("expired") and not collector_event.get("relogin"):
+            if await repair_expired_session(collector_account, session_db, cookie_dir, login_proxy_url, emit):
+                try:
+                    await collect_mission_source()
+                except Exception as e:
+                    emit(f"{NAVERPAY_MISSION_DETAIL_URL}: collection error for {collector_account.user_id} - {e}")
 
     timeout = ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
     async with ClientSession(timeout=timeout) as session:

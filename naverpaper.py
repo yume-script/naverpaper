@@ -9,7 +9,8 @@
   python3 naverpaper.py run
   python3 naverpaper.py total           # 적립 합계(오늘/7일/30일/전체) + 최근 실행 내역
   python3 naverpaper.py notify          # 적립 합계를 디스코드로 전송 (--test: 테스트 메시지)
-  python3 naverpaper.py status          # 계정별 쿠키 상태 확인
+  python3 naverpaper.py status          # 계정별 쿠키 파일 상태 확인(만료일 기준)
+  python3 naverpaper.py verify [아이디]  # 네이버에 실제 접속해 로그인 상태 확인
   python3 naverpaper.py login <아이디>   # 캡차 등으로 자동 로그인이 막힐 때 수동 로그인
   python3 naverpaper.py link <URL>      # 링크 하나만 수동 적립
 
@@ -378,7 +379,7 @@ def notify_captcha(cfg, user_id, image_bytes, hint=""):
     return send_discord_image(url, payload, image_bytes, "captcha.png")
 
 
-def build_embed(cfg, title, stats, run_points=None, error_message=""):
+def build_embed(cfg, title, stats, run_points=None, error_message="", notes=None, alert=False):
     """run_points: {계정: 이번 실행 적립}. None 이면 합계 요약(notify)용."""
     lines = []
     totals = {"today": 0, "d7": 0, "d30": 0, "all": 0}
@@ -400,6 +401,9 @@ def build_embed(cfg, title, stats, run_points=None, error_message=""):
     if error_message:
         color = 0xE74C3C
         head = f"수집 중 오류: {error_message[:300]}"
+    elif alert:
+        color = 0xE74C3C
+        head = "**로그인 문제가 있어 확인이 필요합니다.**"
     elif run_total is not None and run_total > 0:
         color = 0x2ECC71
         head = f"이번 실행 적립 **+{_fmt_point(run_total)}**"
@@ -407,7 +411,10 @@ def build_embed(cfg, title, stats, run_points=None, error_message=""):
         color = 0x95A5A6
         head = f"이번 실행 적립 **+{_fmt_point(run_total)}**" if run_total is not None else "적립 합계"
 
-    description = (head + "\n\n" + "\n".join(lines))[:4000]
+    description = head + "\n\n" + "\n".join(lines)
+    if notes:
+        description += "\n\n" + "\n".join(notes)
+    description = description[:4000]
     return {
         "title": title,
         "description": description,
@@ -422,12 +429,35 @@ def build_embed(cfg, title, stats, run_points=None, error_message=""):
     }
 
 
+def account_issues(result, cfg):
+    """계정별 로그인/세션 문제를 (problems, recovered) 로 돌려준다. 각 항목은 (계정 표시명, 안내 문구)."""
+    problems, recovered = [], []
+    for ar in getattr(result, "account_results", []) or []:
+        uid = getattr(ar, "user_id", "")
+        name = _mask_id(uid) if cfg.get("discord_mask_ids", True) else uid
+        relogin = getattr(ar, "relogin", "") or ""
+        if getattr(ar, "session_expired", False):
+            if relogin == "skipped":
+                text = "네이버 세션이 만료되었지만 최근 30분 안에 재로그인을 이미 시도해 이번에는 건너뛰었습니다. 링크는 처리하지 않았습니다(방문 기록 없음)."
+            elif relogin == "failed":
+                text = "네이버 세션이 만료되었고 자동 재로그인에 실패했습니다. 링크는 처리하지 않았습니다(방문 기록 없음). 터미널에서 `login 아이디`로 수동 로그인이 필요합니다."
+            else:
+                text = "네이버 세션이 만료되어 링크 처리를 중단했습니다(방문 기록 없음). `login 아이디`로 수동 로그인이 필요합니다."
+            problems.append((name, text))
+        elif getattr(ar, "login_failed", False):
+            problems.append((name, "로그인에 실패했습니다(쿠키 만료 또는 캡차 가능성). `login 아이디`로 수동 로그인이 필요합니다."))
+        elif relogin == "ok":
+            recovered.append((name, "세션이 만료되어 자동으로 재로그인했습니다. 정상 처리되었습니다."))
+    return problems, recovered
+
+
 def notify_run(cfg, result, db_path):
     url = cfg["discord_webhook_url"]
     if not url:
         return
     is_error = result.status == "error"
-    if cfg["discord_notify_mode"] == "earned" and not is_error and (result.estimated_points or 0) <= 0:
+    problems, recovered = account_issues(result, cfg)
+    if cfg["discord_notify_mode"] == "earned" and not is_error and not problems and not recovered and (result.estimated_points or 0) <= 0:
         logger.info("적립 0 이라 디스코드 알림은 생략합니다 (discord_notify_mode=earned)")
         return
     account_ids = [a["user_id"] for a in cfg["accounts"]]
@@ -435,7 +465,9 @@ def notify_run(cfg, result, db_path):
     run_points = {uid: 0 for uid in account_ids}
     for ar in getattr(result, "account_results", []) or []:
         run_points[getattr(ar, "user_id", "")] = int(getattr(ar, "estimated_points", 0) or 0)
-    embed = build_embed(cfg, "네이버 폐지줍기 결과", stats, run_points, result.message if is_error else "")
+    notes = [f"[경고] **{n}** {t}" for n, t in problems] + [f"[알림] **{n}** {t}" for n, t in recovered]
+    title = "네이버 폐지줍기 - 로그인 확인 필요" if problems else "네이버 폐지줍기 결과"
+    embed = build_embed(cfg, title, stats, run_points, result.message if is_error else "", notes=notes, alert=bool(problems))
     if send_discord(url, {"embeds": [embed]}):
         logger.info("디스코드 알림 전송 완료")
 
@@ -476,6 +508,11 @@ def cmd_run(np, cfg, args):
                 getattr(ar, "estimated_points", 0),
             )
         logger.info("이번 실행 적립: +%s", _fmt_point(result.estimated_points))
+        _problems, _recovered = account_issues(result, cfg)
+        for n, t in _problems:
+            logger.warning("%s %s", n, t)
+        for n, t in _recovered:
+            logger.info("%s %s", n, t)
         try:
             print_points_report(
                 os.path.join(cfg["data_dir"], "naverpaper.sqlite"),
@@ -521,11 +558,32 @@ def cmd_notify(np, cfg, args):
     return EXIT_ERROR
 
 
+def cmd_verify(np, cfg, args):
+    """쿠키 파일이 아니라 네이버에 실제로 접속해 로그인 상태를 확인한다."""
+    targets = [a for a in cfg["accounts"] if not args.user_id or a["user_id"] == args.user_id]
+    if not targets:
+        logger.error("config.json 에 없는 계정입니다: %s", args.user_id)
+        return EXIT_CONFIG
+    cookie_dir = os.path.join(cfg["data_dir"], "cookies")
+    labels = {"alive": "OK", "expired": "NG", "unknown": "??"}
+    code = EXIT_OK
+    for acc in targets:
+        account = np.AccountConfig(user_id=acc["user_id"], password=acc["password"], keep_login=acc["keep_login"])
+        state, detail = np.verify_session_sync(account, cookie_dir, cfg["reward_proxy_url"], log=lambda m: logger.info("%s", m))
+        print(f"{acc['user_id']}: {labels.get(state, '??')}  {detail}")
+        if state != "alive":
+            code = EXIT_ERROR
+    if code != EXIT_OK:
+        print("NG 이면 `login 아이디` 로 수동 로그인하거나 다음 수집 때 자동 재로그인을 기다리세요.")
+    return code
+
+
 def cmd_status(np, cfg, args):
     cookie_dir = os.path.join(cfg["data_dir"], "cookies")
     for acc in cfg["accounts"]:
         ok, msg = np.check_cookie_status(acc["user_id"], cookie_dir)
         print(f"{acc['user_id']}: {'OK ' if ok else 'NG '} {msg}")
+    print("(쿠키 파일의 만료일만 확인합니다. 네이버 서버의 실제 로그인 상태는 `verify` 로 확인하세요.)")
     return EXIT_OK
 
 
@@ -632,6 +690,8 @@ def main():
     p_total.add_argument("-n", "--runs", type=int, default=10, help="최근 실행 표시 개수 (기본 10)")
     p_notify = sub.add_parser("notify", help="적립 합계를 디스코드로 전송 (수집 없음)")
     p_notify.add_argument("--test", action="store_true", help="테스트 메시지만 전송")
+    p_verify = sub.add_parser("verify", help="네이버에 실제 접속해 로그인 상태 확인")
+    p_verify.add_argument("user_id", nargs="?", default="")
     p_login = sub.add_parser("login", help="수동 로그인(캡차 대응)")
     p_login.add_argument("user_id")
     p_link = sub.add_parser("link", help="링크 하나 수동 적립")
@@ -654,7 +714,7 @@ def main():
         logger.error("pip install -r requirements.txt && playwright install chromium")
         return EXIT_CONFIG
 
-    handlers = {"run": cmd_run, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
+    handlers = {"run": cmd_run, "verify": cmd_verify, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
     try:
         return handlers[command](np, cfg, args)
     except KeyboardInterrupt:

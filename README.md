@@ -95,7 +95,7 @@ nano config.json
 ### 1-6. 첫 실행
 
 ```bash
-python3 naverpaper.py status             # 계정별 쿠키 상태 (처음엔 NG 가 정상)
+python3 naverpaper.py status             # 계정별 쿠키 파일 상태 (처음엔 NG 가 정상)
 python3 naverpaper.py                    # 1회 수집
 ```
 
@@ -154,7 +154,8 @@ python3 naverpaper.py                # 1회 수집 후 종료 (= run)
 python3 naverpaper.py total          # 적립 합계 + 최근 실행 내역 (-n 30 으로 개수 지정)
 python3 naverpaper.py notify         # 적립 합계를 디스코드로 전송 (수집 없음)
 python3 naverpaper.py notify --test  # 디스코드 테스트 메시지
-python3 naverpaper.py status         # 계정별 쿠키 상태
+python3 naverpaper.py status         # 계정별 쿠키 파일 상태 (만료일 기준)
+python3 naverpaper.py verify [아이디] # 네이버에 실제 접속해 로그인 상태 확인 (계정당 10~20초)
 python3 naverpaper.py login 아이디    # 수동 로그인 (캡차 대응)
 python3 naverpaper.py link URL       # 링크 하나만 수동 적립
 python3 naverpaper.py -c 다른설정.json run   # 설정 파일 경로 지정
@@ -162,6 +163,30 @@ python3 naverpaper.py -v             # 자세한 로그
 ```
 
 종료 코드: `0` 정상 / `1` 수집 오류 / `2` 이미 실행 중이라 건너뜀 / `3` 설정·패키지 오류
+
+### 세션 만료 감지와 자동 재로그인
+
+쿠키 파일의 만료일이 남아 있어도 네이버가 서버에서 세션을 무효화하면, 네이버페이 페이지가 로그인 화면(`nid.naver.com/nidlogin...`)으로 이동합니다. 원본은 이를 감지하지 못해 **적립 없이 링크의 "방문 기록"만 남기고**, 로그인을 고쳐도 그 링크를 다시 시도하지 않았습니다. 이 버전은 다음과 같이 처리합니다.
+
+1. 수집 단계(미션 페이지, 포인트 메인)와 계정 처리 단계(포인트 내역 페이지), 링크 처리 중에 로그인 화면으로 이동하면 세션 만료로 판단합니다.
+2. 만료로 판단되면 **링크를 처리하지 않고 방문 기록도 남기지 않습니다.** 나중에 다시 시도됩니다.
+3. 저장된 쿠키와 브라우저 프로필 쿠키를 버리고 **config.json의 비밀번호로 재로그인**한 뒤, 같은 실행 안에서 한 번 더 처리합니다. 수집 단계에서 만료가 확인되면 네이버페이 미션 소스도 다시 수집합니다.
+4. 재로그인은 계정당 한 번의 실행에서 한 번만 시도하고, **30분 안에 다시 시도하지 않습니다**(`data/cookies/<아이디>.relogin` 파일 시각 기준). 캡차 등으로 반복 로그인해 계정이 잠기는 것을 막기 위해서입니다.
+5. 재로그인이 실패하면 무효 쿠키 파일을 지워 `status`에 NG로 보이게 하고, 디스코드로 경고를 보냅니다. 이때는 아래 수동 로그인을 하세요.
+
+디스코드 알림은 다음 두 가지가 추가됩니다. (`discord_notify_mode`가 `earned`여도 항상 전송됩니다.)
+
+- 빨간색 "로그인 확인 필요": 세션 만료나 로그인 실패로 처리하지 못한 계정이 있을 때
+- 결과 메시지의 `[알림]` 줄: 만료됐지만 자동 재로그인에 성공해 정상 처리된 경우
+
+현재 상태를 직접 확인하려면 `verify`를 쓰세요. `status`는 쿠키 파일의 만료일만 보지만 `verify`는 네이버페이에 실제로 접속합니다.
+
+```bash
+./venv/bin/python naverpaper.py verify            # 전체 계정
+./venv/bin/python naverpaper.py verify 아이디      # 한 계정
+```
+
+`OK` 정상 / `NG` 세션 만료(수동 로그인 필요) / `??` 판단 불가(페이지를 읽지 못함). `NG`나 `??`이면 종료 코드가 1입니다.
 
 ### 수동 로그인
 
@@ -227,6 +252,7 @@ idB                          3         3         3           8
   data/
     naverpaper.sqlite      수집·방문·적립 기록 DB
     cookies/<아이디>.json   로그인 쿠키
+    cookies/<아이디>.relogin  마지막 자동 재로그인 시각 (30분 쿨다운 판단용)
     browser_profiles/      로그인용 브라우저 프로필
     naverpaper.log         로그
 ```
@@ -245,7 +271,8 @@ idB                          3         3         3           8
 
 | 도구 | 설명 |
 | --- | --- |
-| `naverpaper_status` | 계정별 쿠키 상태 (아이디 마스킹, `index` 번호 제공) |
+| `naverpaper_status` | 계정별 쿠키 파일 상태 (아이디 마스킹, `index` 번호 제공) |
+| `naverpaper_verify` | 네이버에 실제 접속해 로그인 상태 확인 (`alive`/`expired`/`unknown`, 계정당 10~20초) |
 | `naverpaper_totals` | 오늘/7일/30일/전체 적립 합계 + 최근 실행 내역 (`runs`: 1~50) |
 | `naverpaper_run` | 수집을 **백그라운드로 시작**하고 즉시 반환 |
 | `naverpaper_link` | 링크 하나 수동 적립 (백그라운드, 적립 가능한 https 리워드 링크만 허용) |
@@ -350,15 +377,45 @@ journalctl -u naverpaper-mcp -f
 
 ---
 
-## 8. 문제 해결
+## 8. 원본(ff_naverpaper) 대비 엔진 변경 내역
+
+`source_naverpaper.py`는 원본 코드를 그대로 쓰되 아래 부분만 수정했습니다. 원작자의 업데이트를 합칠 때 이 부분을 확인하세요.
+
+- `AccountResult`: `session_expired`, `login_failed`, `relogin` 필드 추가
+- 새 함수: `is_login_redirect`, `force_relogin`, `repair_expired_session`, `verify_session(_sync)` 와 세션 이벤트 도우미
+- `process_account`, `process_account_manual_link`: 포인트 내역 페이지로 세션을 확인하고, 만료 시 재로그인 후 한 번 재시도. 만료 상태에서는 링크를 처리하지 않고 쿠키를 덮어쓰지 않음
+- `process_campaign_links`: 링크 처리 중 로그인 화면으로 이동하면 중단하고 방문 기록을 저장하지 않음
+- `save_naver_campaign_urls`, `process_naverpay_mission_detail_source`, `process_naverpay_point_main`: 로그인 화면 이동 감지와 재로그인 후 미션 소스 재수집
+
+## 9. 문제 해결
 
 | 증상 | 확인 |
 | --- | --- |
 | `필수 패키지가 없습니다` | `source venv/bin/activate` 후 `pip install -r requirements.txt`, `playwright install chromium` |
 | chromium 실행 오류, 공유 라이브러리 누락 | `playwright install-deps chromium` |
+| 적립이 계속 0, 로그에 `nid.naver.com/nidlogin` 주소가 보임 | 세션 만료입니다. 이 버전은 자동 재로그인하지만 실패하면 디스코드로 경고합니다. `verify` 로 확인하고 `login 아이디` 로 수동 로그인 |
+| `session expired; re-login skipped (tried within the last 30 min)` | 30분 이내에 재로그인을 이미 시도해 건너뜀. 수동 로그인하거나 30분 뒤 다음 실행을 기다리세요 |
 | 계정이 NG 로 나오고 로그인이 안 됨 | `python3 naverpaper.py login 아이디` 로 수동 로그인 |
 | 종료 코드 2 | 이전 수집이 아직 실행 중이라 건너뜀. 정상 동작 |
 | 디스코드로 안 옴 | `notify --test` 실행 후 로그의 HTTP 상태 확인 (404: 주소 또는 thread_id 오류, 401: 토큰 오류) |
 | MCP: LiteLLM 에서 연결 실패 | 서버 주소/포트, 방화벽, 토큰 일치 여부 확인. 컨테이너라면 `127.0.0.1` 대신 호스트 IP 사용. `journalctl -u naverpaper-mcp` 확인 |
 | MCP: `421 Invalid Host header` | `--allowed-host 서버IP:포트` 추가 |
 | cron 에서만 실패 | cron 줄에서 `cd` 와 `./venv/bin/python` 경로 확인, `/mnt` 마운트 상태 확인 |
+
+### 이전 버전에서 로그인이 풀린 채 처리된 링크 복구
+
+이 버전으로 올리기 전, 로그인이 풀린 상태에서 처리된 링크는 적립 없이 방문 기록만 남아 있을 수 있습니다. 오늘 기록만 지우면 다시 시도됩니다. 수집이 실행 중이 아닐 때, 로그인 상태를 `verify`로 확인한 뒤 실행하세요.
+
+```bash
+cd /mnt/naverpaper
+cp data/naverpaper.sqlite data/naverpaper.sqlite.bak
+python3 - <<'EOF'
+import sqlite3
+c = sqlite3.connect("data/naverpaper.sqlite")
+n = c.execute("DELETE FROM url_visits WHERE user_id='아이디' AND visited_at >= date('now','localtime')").rowcount
+c.commit(); print("삭제한 방문 기록:", n)
+EOF
+./venv/bin/python naverpaper.py
+```
+
+이미 적립받은 링크는 다시 방문해도 중복 적립되지 않고(시간만 더 걸림), 만료된 이벤트는 적립되지 않습니다.

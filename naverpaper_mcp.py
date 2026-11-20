@@ -3,7 +3,8 @@
 
 노출하는 도구는 모두 이름이 `naverpaper_` 로 시작합니다.
 
-  naverpaper_status        계정별 쿠키 상태
+  naverpaper_status        계정별 쿠키 파일 상태(만료일 기준)
+  naverpaper_verify        네이버에 실제 접속해 로그인 상태 확인
   naverpaper_totals        적립 합계(오늘/7일/30일/전체) + 최근 실행 내역
   naverpaper_run           수집을 백그라운드로 시작 (즉시 반환)
   naverpaper_link          링크 하나 수동 적립을 백그라운드로 시작 (즉시 반환)
@@ -143,6 +144,9 @@ def _summarize(result, cfg):
                 "visited": int(getattr(ar, "visited_url_count", 0) or 0),
                 "skipped": int(getattr(ar, "skipped_url_count", 0) or 0),
                 "points": int(getattr(ar, "estimated_points", 0) or 0),
+                "session_expired": bool(getattr(ar, "session_expired", False)),
+                "login_failed": bool(getattr(ar, "login_failed", False)),
+                "relogin": getattr(ar, "relogin", "") or "",
             }
         )
     return {
@@ -257,6 +261,28 @@ def _status_data():
                 "password_configured": bool(acc["password"]),
             }
         )
+    return {"accounts": rows}
+
+
+def _verify(account):
+    cfg = _cfg()
+    np = _np()
+    if str(account or "").strip():
+        target = _resolve_account(cfg, account)
+        targets = [target] if target else []
+        if not targets:
+            return {"error": "해당 계정을 찾을 수 없습니다. naverpaper_status 의 index 또는 account 값을 사용하세요."}
+    else:
+        targets = list(cfg["accounts"])
+    cookie_dir = _paths(cfg)["cookies"]
+    rows = []
+    for acc in targets:
+        obj = np.AccountConfig(user_id=acc["user_id"], password=acc["password"], keep_login=acc["keep_login"])
+        try:
+            state, detail = np.verify_session_sync(obj, cookie_dir, cfg["reward_proxy_url"], log=_engine_log)
+        except Exception as e:  # noqa: BLE001
+            state, detail = "unknown", _scrub(str(e), cfg)[:200]
+        rows.append({"account": _mask(acc["user_id"]), "state": state, "detail": _scrub(detail, cfg)})
     return {"accounts": rows}
 
 
@@ -517,6 +543,11 @@ async def naverpaper_totals(runs: int = 10) -> dict:
     return await asyncio.to_thread(_totals_data, runs)
 
 
+async def naverpaper_verify(account: str = "") -> dict:
+    """네이버에 실제로 접속해 로그인 상태를 확인합니다(계정당 약 10~20초). naverpaper_status 는 쿠키 파일의 만료일만 보지만 이 도구는 서버 세션이 살아 있는지 확인합니다. account 를 비우면 모든 계정을 확인합니다. state: alive 정상 / expired 세션 만료(수동 로그인 필요) / unknown 판단 불가."""
+    return await asyncio.to_thread(_verify, account)
+
+
 async def naverpaper_run() -> dict:
     """네이버 폐지줍기 수집을 백그라운드로 시작하고 즉시 반환합니다. 몇 분 걸릴 수 있으니 naverpaper_run_status 로 진행 상황을 확인하세요."""
     return _start_job("run", _do_run)
@@ -567,6 +598,7 @@ async def naverpaper_login_submit(account: str, captcha_text: str):
 # (함수, 읽기 전용 여부)
 TOOLS = [
     (naverpaper_status, True),
+    (naverpaper_verify, True),
     (naverpaper_totals, True),
     (naverpaper_run_status, True),
     (naverpaper_logs, True),
