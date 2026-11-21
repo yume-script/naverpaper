@@ -540,11 +540,15 @@ def check_storage_data_status(data):
             valid.append(cookie.get("name"))
     if expired:
         return False, f"expired cookies: {', '.join(expired)}"
-    if session_only:
-        return False, f"session-only cookies: {', '.join(session_only)}"
-    missing = [name for name in required_cookies if not any(item.startswith(name) or item == name for item in valid)]
+    # 만료일이 없는 세션 쿠키도 저장된 상태 파일로 새 브라우저에 주입하면 쓸 수 있다. 실제 유효 여부는 네이버 서버가
+    # 결정하므로 여기서는 거부하지 않고(과거에는 매 실행마다 비밀번호 로그인을 유발), 세션 만료는 실행 중
+    # 로그인 화면 이동 감지와 자동 재로그인으로 처리한다.
+    present = valid + session_only
+    missing = [name for name in required_cookies if not any(item.startswith(name) or item == name for item in present)]
     if missing:
         return False, f"required cookies missing: {', '.join(missing)}"
+    if session_only:
+        return True, f"valid cookies: {', '.join(present)} (session-only, no expiry date; the server decides the lifetime)"
     return True, f"valid cookies: {', '.join(valid)}"
 
 
@@ -638,6 +642,28 @@ async def password_login_on_page(page, account: AccountConfig, emit: Callable[[s
     return False, "login did not produce required cookies"
 
 
+KEEP_LOGIN_LABEL_RE = re.compile(r"로그인\s*상태\s*유지")
+
+
+async def _keep_login_state_near(locator):
+    """'로그인 상태 유지' 문구 주변에서 체크 상태를 읽는다. 체크박스가 하나뿐인 가장 가까운 상위 요소만 본다. 알 수 없으면 None."""
+    try:
+        return await locator.evaluate(
+            r"""(el) => {
+                let node = el;
+                for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
+                    const aria = node.getAttribute && node.getAttribute('aria-checked');
+                    if (aria === 'true' || aria === 'false') return aria === 'true';
+                    const inputs = node.querySelectorAll ? node.querySelectorAll('input[type=checkbox]') : [];
+                    if (inputs.length === 1) return !!inputs[0].checked;
+                }
+                return null;
+            }"""
+        )
+    except Exception:
+        return None
+
+
 async def set_keep_login(page, enabled: bool, emit: Callable[[str], None], user_id: str = ""):
     selectors = [
         "#keep",
@@ -663,6 +689,43 @@ async def set_keep_login(page, enabled: bool, emit: Callable[[str], None], user_
             return True
         except Exception:
             continue
+
+    # 개편된 로그인 화면: 아이디가 달라져도 "로그인 상태 유지" 문구로 찾는다 (옆의 "IP 보안" 토글은 건드리지 않는다)
+    for build in (
+        lambda: page.get_by_role("checkbox", name=KEEP_LOGIN_LABEL_RE),
+        lambda: page.get_by_label(KEEP_LOGIN_LABEL_RE),
+    ):
+        try:
+            locator = build().first
+            if await locator.count() == 0:
+                continue
+            await locator.set_checked(bool(enabled), timeout=3000)
+            emit(f"{user_id}: login diagnostic - keep-login set to {enabled} (by label)")
+            return True
+        except Exception:
+            continue
+    try:
+        text_locator = page.get_by_text(KEEP_LOGIN_LABEL_RE).first
+        if await text_locator.count() > 0:
+            state = await _keep_login_state_near(text_locator)
+            if state is None or bool(state) != bool(enabled):
+                await text_locator.click(timeout=3000)
+            emit(f"{user_id}: login diagnostic - keep-login set to {enabled} (by text click; previous state={state})")
+            return True
+    except Exception:
+        pass
+
+    # 그래도 못 찾으면 다음 수정에 쓸 수 있도록 후보 요소의 HTML 을 로그에 남긴다
+    try:
+        candidates = await page.evaluate(
+            r"""() => Array.from(document.querySelectorAll('*'))
+                .filter((el) => el.children.length < 6 && /로그인\s*상태\s*유지/.test(el.textContent || ''))
+                .slice(-3)
+                .map((el) => el.outerHTML.slice(0, 400))"""
+        )
+        emit(f"{user_id}: login diagnostic - keep-login candidates: {candidates}")
+    except Exception:
+        pass
     emit(f"{user_id}: login diagnostic - keep-login control not found")
     return False
 
@@ -1295,6 +1358,10 @@ async def submit_login_captcha(user_id: str, captcha_text: str, cookie_dir: str,
             submit = page.locator("#log\\.login").first
             if await submit.count() == 0:
                 submit = page.locator("button[type='submit'], input[type='submit']").first
+            if await submit.count() == 0:
+                submit = page.get_by_role("button", name="로그인", exact=True).first
+            if await submit.count() == 0:
+                raise RuntimeError("login button not found")  # 5초 기다리지 않고 바로 Enter 로 넘어간다
             await submit.click(timeout=5000, force=True)
         except Exception as e:
             emit(f"{user_id}: manual login diagnostic - submit click failed: {e}; pressing Enter")
@@ -1313,7 +1380,8 @@ async def submit_login_captcha(user_id: str, captcha_text: str, cookie_dir: str,
         with open(cookie_path(cookie_dir, user_id), "w", encoding="utf-8") as f:
             json.dump(storage, f, ensure_ascii=False, indent=2)
         await _close_login_session(user_id)
-        emit(f"{user_id}: captcha login success")
+        _ok, _cookie_message = check_storage_data_status(storage)
+        emit(f"{user_id}: captcha login success ({_cookie_message})")
         return {"ret": "success", "msg": "cookie refreshed", "cookies": storage_cookie_values(storage)}
     except Exception as e:
         screenshot = ""
