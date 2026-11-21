@@ -232,6 +232,9 @@ def points_report(db_path, accounts=None):
                 if ts >= cutoff:
                     entry[key] += points
     if accounts:
+        # 설정에서 빠진 옛 계정 중 적립이 한 번도 없던 계정은 합계 표에 나오지 않게 한다 (적립 기록이 있으면 유지)
+        for user_id in [u for u in stats if u not in accounts and stats[u]["all"] == 0]:
+            del stats[user_id]
         for user_id in accounts:
             stats.setdefault(user_id, {"today": 0, "d7": 0, "d30": 0, "all": 0})
     return stats, first, run_count
