@@ -391,6 +391,7 @@ journalctl -u naverpaper-mcp -f
 - `AccountResult`: `session_expired`, `login_failed`, `relogin` 필드 추가
 - 새 함수: `is_login_redirect`, `force_relogin`, `repair_expired_session`, `verify_session(_sync)` 와 세션 이벤트 도우미
 - `process_account`, `process_account_manual_link`: 포인트 내역 페이지로 세션을 확인하고, 만료 시 재로그인 후 한 번 재시도. 만료 상태에서는 링크를 처리하지 않고 쿠키를 덮어쓰지 않음
+- `get_naverpay_point_balance`: 값이 나올 때까지 다시 읽고(0/실패 시 진단 로그), `AccountResult.balance_unreliable` 로 잔액을 못 믿는 경우를 표시
 - `process_campaign_links`: 링크 처리 중 로그인 화면으로 이동하면 중단하고 방문 기록을 저장하지 않음
 - `save_naver_campaign_urls`, `process_naverpay_mission_detail_source`, `process_naverpay_point_main`: 로그인 화면 이동 감지와 재로그인 후 미션 소스 재수집
 
@@ -404,6 +405,8 @@ journalctl -u naverpaper-mcp -f
 | `session expired; re-login skipped (tried within the last 30 min)` | 30분 이내에 재로그인을 이미 시도해 건너뜀. 수동 로그인하거나 30분 뒤 다음 실행을 기다리세요 |
 | 로그인 로그에 `keep-login control not found` | 개편된 네이버 로그인 화면에서 "로그인 상태 유지"를 못 찾은 경우입니다. 이 버전은 문구 기반으로 다시 찾고, 그래도 못 찾으면 `keep-login candidates: [...]` 줄로 후보 요소의 HTML을 남깁니다. 그 줄을 알려 주시면 정확히 고칠 수 있습니다 |
 | 로그인 성공 로그에 `session-only, no expiry date` | "로그인 상태 유지"가 적용되지 않아 세션 쿠키로 로그인된 것입니다. 동작은 하지만 세션이 일찍 끝날 수 있어, 만료되면 자동 재로그인합니다 |
+| 로그에 `point balance 0 -> 0 (+0)`, 앱에서는 적립 알림이 왔음 | 잔액을 못 읽었거나 로딩 전 기본값 `0원`을 읽은 경우입니다. 이 버전은 값이 나올 때까지 최대 약 15초 다시 읽고, 끝까지 0이거나 못 읽으면 `point balance diagnostic - ... lines near '내 포인트'=[...]` 줄로 화면 내용을 남기며 디스코드 결과에 `[참고]` 줄을 붙입니다. 적립액이 정확하지 않다는 뜻이므로 네이버페이 포인트 내역으로 확인하세요. 진단 로그 줄을 알려 주시면 읽기 방식을 맞춰 고칠 수 있습니다 |
+| `config.json`에 `네이버아이디2` 같은 예시 계정이 남아 있음 | `config.example.json`의 예시 계정입니다. 실제 계정이 아니면 삭제하세요. 가짜 계정으로 로그인을 시도하면 시간 낭비이고 네이버 보안에 걸릴 수 있으며 합계 표에도 0인 줄이 생깁니다 |
 | 계정이 NG 로 나오고 로그인이 안 됨 | `python3 naverpaper.py login 아이디` 로 수동 로그인 |
 | 종료 코드 2 | 이전 수집이 아직 실행 중이라 건너뜀. 정상 동작 |
 | 디스코드로 안 옴 | `notify --test` 실행 후 로그의 HTTP 상태 확인 (404: 주소 또는 thread_id 오류, 401: 토큰 오류) |

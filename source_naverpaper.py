@@ -495,6 +495,7 @@ class AccountResult:
     session_expired: bool = False  # 네이버 서버에서 세션이 무효화됨 (재로그인까지 실패한 경우 포함)
     login_failed: bool = False  # 로그인 자체에 실패
     relogin: str = ""  # 자동 재로그인 결과: "", "ok", "failed", "skipped"
+    balance_unreliable: bool = False  # 포인트 잔액을 읽지 못했거나 0 으로만 읽혀 적립액(estimated_points)을 믿기 어려움
 
 
 def cookie_path(cookie_dir: str, nid: str) -> str:
@@ -957,6 +958,16 @@ def note_session_event(user_id, **values):
     _SESSION_EVENTS.setdefault(str(user_id or ""), {}).update(values)
 
 
+def _mark_balance_reliability(result, before_points, after_points, emit):
+    """잔액을 못 읽었거나 앞뒤가 모두 0이면 적립액 계산을 믿을 수 없다고 표시한다 (앱 알림과 리포트가 어긋나는 경우의 단서)."""
+    if before_points is None or after_points is None or (before_points == 0 and after_points == 0):
+        result.balance_unreliable = True
+        emit(
+            f"{result.user_id}: point balance could not be read reliably (before={before_points}, after={after_points}); "
+            "the reported earned amount may be inaccurate - check the Naver Pay point history"
+        )
+
+
 def _apply_session_events(account_result):
     ev = session_event(account_result.user_id)
     if ev.get("relogin"):
@@ -1080,7 +1091,7 @@ async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_u
             )
             page = await context.new_page()
             await Stealth().apply_stealth_async(page)
-            points = await get_naverpay_point_balance(page)
+            points = await get_naverpay_point_balance(page, emit, account.user_id)
             if is_login_redirect(page.url):
                 return "expired", "redirected to login (server-side session is no longer valid)"
             if points is None:
@@ -2505,7 +2516,7 @@ async def process_account(
                     result.login_failed = True
                     result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
                 else:
-                    before_points = await get_naverpay_point_balance(page)
+                    before_points = await get_naverpay_point_balance(page, emit, account.user_id)
                     if is_login_redirect(page.url):
                         # 쿠키 파일은 유효해 보여도 서버에서 세션이 무효화된 상태
                         emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
@@ -2515,7 +2526,7 @@ async def process_account(
                         if before_points is None:
                             emit(f"{account.user_id}: point balance unavailable before run (could not read the balance)")
                         details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
-                        after_points = await get_naverpay_point_balance(page)
+                        after_points = await get_naverpay_point_balance(page, emit, account.user_id)
                         result.details.extend(details)
                         result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                         result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
@@ -2524,6 +2535,7 @@ async def process_account(
                             emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
                         else:
                             result.estimated_points = 0
+                        _mark_balance_reliability(result, before_points, after_points, emit)
                         if any(x.status == "login_error" for x in details):
                             result.session_expired = True
                             note_session_event(account.user_id, expired=True)
@@ -2548,20 +2560,49 @@ async def process_account(
     return result
 
 
-async def get_naverpay_point_balance(page) -> Optional[int]:
+def _parse_point_balance(lines):
+    """페이지의 줄 목록에서 '내 포인트' 잔액을 찾는다. (잔액 또는 None, '내 포인트' 줄 위치 또는 -1)"""
+    for idx, line in enumerate(lines):
+        same_line = re.fullmatch(r"내 포인트\s*([\d,]+)\s*(원|P)", line)
+        if same_line:
+            return int(re.sub(r"[^0-9]", "", same_line.group(1)) or "0"), idx
+        if line != "내 포인트":
+            continue
+        window = lines[idx + 1 : idx + 8]
+        for item in window:  # 금액만 있는 줄을 우선
+            if re.fullmatch(r"[\d,]+\s*(원|P)", item):
+                return int(re.sub(r"[^0-9]", "", item) or "0"), idx
+        for item in window:  # 예전 방식: 숫자가 있고 '원'으로 끝나는 첫 줄
+            if item.endswith("원") and any(ch.isdigit() for ch in item):
+                return int(re.sub(r"[^0-9]", "", item) or "0"), idx
+        return None, idx
+    return None, -1
+
+
+async def get_naverpay_point_balance(page, emit: Optional[Callable[[str], None]] = None, label: str = "") -> Optional[int]:
+    """네이버페이 포인트 잔액. 로딩 중에는 '0원' 같은 기본값이 보일 수 있어, 0보다 큰 값이 나오거나 시간이 다 될 때까지 다시 읽는다."""
+    value, idx, lines = None, -1, []
     try:
         await page.goto("https://pay.naver.com/pointshistory/list?category=all", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(5000)
-        body = await page.locator("body").inner_text(timeout=5000)
-        lines = [x.strip() for x in body.splitlines() if x.strip()]
-        for idx, line in enumerate(lines):
-            if line == "내 포인트":
-                for item in lines[idx + 1 : idx + 8]:
-                    if item.endswith("원") and any(ch.isdigit() for ch in item):
-                        return int(re.sub(r"[^0-9]", "", item) or "0")
-    except Exception:
-        pass
-    return None
+        deadline = time.time() + 12
+        await page.wait_for_timeout(2500)
+        while True:
+            body = await page.locator("body").inner_text(timeout=5000)
+            lines = [x.strip() for x in body.splitlines() if x.strip()]
+            value, idx = _parse_point_balance(lines)
+            if value is not None and value > 0:
+                return value
+            if time.time() >= deadline:
+                break
+            await page.wait_for_timeout(1500)
+    except Exception as e:
+        if emit:
+            emit(f"{label}: point balance read error - {e}")
+        return None
+    if emit:
+        sample = lines[idx : idx + 8] if idx >= 0 else lines[:12]
+        emit(f"{label}: point balance diagnostic - value={value} lines near '내 포인트'={sample}")
+    return value
 
 
 async def process_account_manual_link(
@@ -2605,14 +2646,14 @@ async def process_account_manual_link(
 
         login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
         if login_ok:
-            before_points = await get_naverpay_point_balance(page)
+            before_points = await get_naverpay_point_balance(page, emit, account.user_id)
             if is_login_redirect(page.url):
                 emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
                 note_session_event(account.user_id, expired=True)
                 expired = True
             else:
                 details = await process_campaign_links(page, [link], session_db, account.user_id, emit)
-                after_points = await get_naverpay_point_balance(page)
+                after_points = await get_naverpay_point_balance(page, emit, account.user_id)
                 result.details.extend(details)
                 result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                 result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
@@ -2621,6 +2662,7 @@ async def process_account_manual_link(
                     emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
                 else:
                     result.estimated_points = 0
+                _mark_balance_reliability(result, before_points, after_points, emit)
                 if any(x.status == "login_error" for x in details):
                     result.session_expired = True
                     note_session_event(account.user_id, expired=True)

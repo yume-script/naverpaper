@@ -147,6 +147,7 @@ def _summarize(result, cfg):
                 "session_expired": bool(getattr(ar, "session_expired", False)),
                 "login_failed": bool(getattr(ar, "login_failed", False)),
                 "relogin": getattr(ar, "relogin", "") or "",
+                "balance_unreliable": bool(getattr(ar, "balance_unreliable", False)),
             }
         )
     return {

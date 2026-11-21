@@ -453,13 +453,25 @@ def account_issues(result, cfg):
     return problems, recovered
 
 
+def balance_notes(result, cfg):
+    """포인트 잔액을 믿기 어려운 계정 안내 문구 목록."""
+    notes = []
+    for ar in getattr(result, "account_results", []) or []:
+        if getattr(ar, "balance_unreliable", False):
+            uid = getattr(ar, "user_id", "")
+            name = _mask_id(uid) if cfg.get("discord_mask_ids", True) else uid
+            notes.append(f"[참고] **{name}** 포인트 잔액을 정확히 읽지 못해(읽기 실패 또는 0으로만 표시) 적립액이 실제와 다를 수 있습니다. 네이버페이 포인트 내역으로 확인하세요.")
+    return notes
+
+
 def notify_run(cfg, result, db_path):
     url = cfg["discord_webhook_url"]
     if not url:
         return
     is_error = result.status == "error"
     problems, recovered = account_issues(result, cfg)
-    if cfg["discord_notify_mode"] == "earned" and not is_error and not problems and not recovered and (result.estimated_points or 0) <= 0:
+    unreliable = balance_notes(result, cfg)
+    if cfg["discord_notify_mode"] == "earned" and not is_error and not problems and not recovered and not unreliable and (result.estimated_points or 0) <= 0:
         logger.info("적립 0 이라 디스코드 알림은 생략합니다 (discord_notify_mode=earned)")
         return
     account_ids = [a["user_id"] for a in cfg["accounts"]]
@@ -467,7 +479,7 @@ def notify_run(cfg, result, db_path):
     run_points = {uid: 0 for uid in account_ids}
     for ar in getattr(result, "account_results", []) or []:
         run_points[getattr(ar, "user_id", "")] = int(getattr(ar, "estimated_points", 0) or 0)
-    notes = [f"[경고] **{n}** {t}" for n, t in problems] + [f"[알림] **{n}** {t}" for n, t in recovered]
+    notes = [f"[경고] **{n}** {t}" for n, t in problems] + [f"[알림] **{n}** {t}" for n, t in recovered] + unreliable
     title = "네이버 폐지줍기 - 로그인 확인 필요" if problems else "네이버 폐지줍기 결과"
     embed = build_embed(cfg, title, stats, run_points, result.message if is_error else "", notes=notes, alert=bool(problems))
     if send_discord(url, {"embeds": [embed]}):
@@ -515,6 +527,8 @@ def cmd_run(np, cfg, args):
             logger.warning("%s %s", n, t)
         for n, t in _recovered:
             logger.info("%s %s", n, t)
+        for note in balance_notes(result, cfg):
+            logger.warning("%s", note.replace("**", ""))
         try:
             print_points_report(
                 os.path.join(cfg["data_dir"], "naverpaper.sqlite"),
