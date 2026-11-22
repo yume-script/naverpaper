@@ -29,5 +29,8 @@
 
   "mcp_token": "",
 
+  "stall_alert_minutes": 15,
+  "max_run_minutes": 60,
+
   "data_dir": ""
 }

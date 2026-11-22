@@ -148,6 +148,7 @@ def _summarize(result, cfg):
                 "login_failed": bool(getattr(ar, "login_failed", False)),
                 "relogin": getattr(ar, "relogin", "") or "",
                 "balance_unreliable": bool(getattr(ar, "balance_unreliable", False)),
+                "login_error": _scrub(getattr(ar, "login_error", "") or "", cfg)[:200],
             }
         )
     return {
@@ -190,6 +191,32 @@ def _start_job(kind, fn):
     return {"started": True, "kind": kind, "started_at": started_at, "next": "naverpaper_run_status 로 진행 상황을 확인하세요."}
 
 
+def _notify_safely(fn, *args):
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001
+        logger.exception("디스코드 알림 실패")
+        return False
+
+
+def _begin_guard(cfg, source):
+    """락을 잡은 직후: 이전 비정상 종료 확인, 진행 추적과 멈춤 감시 시작."""
+    _notify_safely(nv.check_previous_abnormal_exit, cfg)
+    tracker = nv.ProgressTracker()
+    nv.begin_run_state(cfg, tracker, source)
+    watchdog = nv.RunWatchdog(cfg, tracker, source, state_path=nv.run_state_path(cfg))
+    watchdog.start()
+    return tracker, watchdog
+
+
+def _guarded_log(tracker):
+    def log(message):
+        logger.info("%s", message)
+        tracker.log(message)
+
+    return log
+
+
 def _do_run():
     cfg = _cfg()
     np = _np()
@@ -197,7 +224,9 @@ def _do_run():
     os.makedirs(cfg["data_dir"], exist_ok=True)
     lock = nv.RunLock(p["lock"])
     if not lock.acquire():
+        _notify_safely(nv.notify_lock_held, cfg, lock, "MCP 실행")
         return {"status": "skipped", "message": "다른 수집 또는 로그인이 이미 진행 중이라 건너뜁니다."}
+    tracker, watchdog = _begin_guard(cfg, "MCP 수집 실행")
     try:
         nv.seed_cookies(np, cfg, cfg["accounts"])
         run_cfg = np.RunConfig(
@@ -210,14 +239,21 @@ def _do_run():
             keep_campaign_days=cfg["keep_campaign_days"],
             keep_user_days=cfg["keep_user_days"],
         )
-        result = np.run_sync(run_cfg, log=_engine_log)
+        try:
+            result = np.run_sync(run_cfg, log=_guarded_log(tracker))
+        except Exception as e:  # noqa: BLE001
+            _notify_safely(nv.notify_crash, cfg, e, tracker, "MCP 수집 실행")
+            nv.finish_run(cfg, watchdog)
+            raise
         logger.info("수집 종료 status=%s 예상포인트=%s", result.status, result.estimated_points)
         try:
             nv.notify_run(cfg, result, p["db"])
         except Exception:  # noqa: BLE001
             logger.exception("디스코드 알림 실패")
+        nv.finish_run(cfg, watchdog)
         return _summarize(result, cfg)
     finally:
+        watchdog.stop()
         lock.release()
 
 
@@ -228,20 +264,29 @@ def _do_link(url):
     os.makedirs(cfg["data_dir"], exist_ok=True)
     lock = nv.RunLock(p["lock"])
     if not lock.acquire():
+        _notify_safely(nv.notify_lock_held, cfg, lock, "MCP 실행")
         return {"status": "skipped", "message": "다른 수집 또는 로그인이 이미 진행 중이라 건너뜁니다."}
+    tracker, watchdog = _begin_guard(cfg, "MCP 링크 적립")
     try:
         nv.seed_cookies(np, cfg, cfg["accounts"])
-        result = np.run_manual_link_sync(
-            p["db"],
-            p["cookies"],
-            nv.build_accounts(np, cfg["accounts"]),
-            url,
-            cfg["reward_proxy_url"],
-            log=_engine_log,
-            login_proxy_url=cfg["login_proxy_url"],
-        )
+        try:
+            result = np.run_manual_link_sync(
+                p["db"],
+                p["cookies"],
+                nv.build_accounts(np, cfg["accounts"]),
+                url,
+                cfg["reward_proxy_url"],
+                log=_guarded_log(tracker),
+                login_proxy_url=cfg["login_proxy_url"],
+            )
+        except Exception as e:  # noqa: BLE001
+            _notify_safely(nv.notify_crash, cfg, e, tracker, "MCP 링크 적립")
+            nv.finish_run(cfg, watchdog)
+            raise
+        nv.finish_run(cfg, watchdog)
         return _summarize(result, cfg)
     finally:
+        watchdog.stop()
         lock.release()
 
 

@@ -23,8 +23,11 @@ import logging
 import os
 import sys
 import sqlite3
+import threading
 import time
+import traceback
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -103,6 +106,8 @@ def load_config(path):
         "discord_notify_mode": notify_mode,
         "discord_mask_ids": _to_bool(cfg.get("discord_mask_ids"), True),
         "mcp_token": str(cfg.get("mcp_token") or "").strip(),
+        "stall_alert_minutes": max(0, _to_int(cfg.get("stall_alert_minutes"), 15)),
+        "max_run_minutes": max(0, _to_int(cfg.get("max_run_minutes"), 60)),
     }
 
 
@@ -122,25 +127,47 @@ def setup_logging(data_dir, verbose=False):
     logger.addHandler(fh)
 
 
+def _parse_lock_info(text):
+    parts = str(text or "").split()
+    info = {}
+    try:
+        if parts:
+            info["pid"] = int(parts[0])
+        if len(parts) > 1:
+            info["started"] = float(parts[1])
+    except ValueError:
+        pass
+    return info
+
+
 class RunLock:
-    """cron 중복 실행 방지용 파일 락 (리눅스/맥). 락을 못 잡으면 acquire() 가 False."""
+    """cron 중복 실행 방지용 파일 락 (리눅스/맥). 락을 못 잡으면 acquire() 가 False 이고, holder 에 락을 잡은 쪽의 pid/시작 시각이 들어 있다."""
 
     def __init__(self, path):
         self.path = path
         self.fp = None
+        self.holder = {}
 
     def acquire(self):
+        self.holder = {}
         try:
             import fcntl
         except ImportError:  # Windows 등: 락 없이 진행
             return True
-        self.fp = open(self.path, "w")
+        self.fp = open(self.path, "a+")  # 락을 못 잡아도 보유자 정보를 지우지 않도록 truncate 하지 않는다
         try:
             fcntl.flock(self.fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.fp.write(str(os.getpid()))
+            self.fp.seek(0)
+            self.fp.truncate()
+            self.fp.write(f"{os.getpid()} {int(time.time())}")
             self.fp.flush()
             return True
         except OSError:
+            try:
+                self.fp.seek(0)
+                self.holder = _parse_lock_info(self.fp.read())
+            except Exception:
+                self.holder = {}
             self.fp.close()
             self.fp = None
             return False
@@ -434,26 +461,323 @@ def build_embed(cfg, title, stats, run_points=None, error_message="", notes=None
     }
 
 
+def _clean_text(text, cfg):
+    """디스코드로 보내는 문구에서 계정 아이디는 마스킹하고 비밀번호는 가린다."""
+    text = str(text or "")
+    for acc in cfg.get("accounts", []):
+        if acc.get("password") and len(acc["password"]) >= 4:
+            text = text.replace(acc["password"], "***")
+    if cfg.get("discord_mask_ids", True):
+        for acc in cfg.get("accounts", []):
+            if acc.get("user_id"):
+                text = text.replace(acc["user_id"], _mask_id(acc["user_id"]))
+    return text
+
+
+LOGIN_CAUSES = [
+    ("reason=captcha", "캡차(자동입력 방지 문자) 요구", "터미널에서 `login 아이디` 를 실행하세요. 캡차 이미지가 디스코드로 전송됩니다."),
+    ("reason=wrong_credentials", "아이디 또는 비밀번호 불일치", "config.json 의 아이디/비밀번호를 확인하세요. 네이버에서 비밀번호를 바꿨다면 새 비밀번호로 수정하세요."),
+    ("reason=verification", "추가 인증 요구(2단계 인증, 본인 확인, 새 환경 확인)", "PC 브라우저에서 같은 계정으로 로그인해 인증을 마친 뒤 `login 아이디` 를 실행하세요."),
+    ("reason=account_locked", "계정 보호조치 또는 이용 제한", "네이버에 직접 로그인해 계정 상태 안내를 확인하세요."),
+    ("reason=dormant", "휴면 계정", "네이버에 직접 로그인해 휴면 해제를 하세요."),
+    ("password empty", "비밀번호가 설정되어 있지 않음", "config.json 의 해당 계정에 password 를 입력하세요."),
+    ("login page timeout", "로그인 페이지 접속 시간 초과", "서버 네트워크, 프록시, 부하를 확인하세요. 다음 실행에서 다시 시도됩니다."),
+    ("cooldown", "최근 30분 안에 재로그인을 이미 시도해 건너뜀", "수동 로그인하거나 30분 뒤 다음 실행을 기다리세요."),
+    ("waiting for locator", "로그인 화면 구조 변경 의심(입력칸을 찾지 못함)", "로그의 `login diagnostic` 줄을 확인하고 알려 주세요."),
+    ("locator.", "로그인 화면 구조 변경 의심(입력칸을 찾지 못함)", "로그의 `login diagnostic` 줄을 확인하고 알려 주세요."),
+    ("net::err", "네트워크 오류", "서버 네트워크와 프록시 설정을 확인하세요."),
+    ("timeout", "접속 시간 초과", "서버 부하와 네트워크를 확인하세요. 다음 실행에서 다시 시도됩니다."),
+    ("did not produce required cookies", "로그인 실패(원인을 특정하지 못함)", "로그의 `login diagnostic - failed final_url=... body=...` 줄을 확인하고 `login 아이디` 로 수동 로그인해 보세요."),
+]
+
+
+def describe_login_cause(raw):
+    """엔진이 남긴 실패 사유 원문 -> (원인, 조치). 알 수 없으면 일반 안내."""
+    low = str(raw or "").lower()
+    for key, cause, action in LOGIN_CAUSES:
+        if key in low:
+            return cause, action
+    return "원인을 알 수 없음", "로그를 확인하고 `login 아이디` 로 수동 로그인해 보세요."
+
+
+def _cause_text(raw, cfg):
+    cause, action = describe_login_cause(raw)
+    text = f" 원인: {cause}. 조치: {action}"
+    raw = _clean_text(raw, cfg).strip()
+    if raw:
+        text += f" (원문: `{raw[:150]}`)"
+    return text
+
+
 def account_issues(result, cfg):
-    """계정별 로그인/세션 문제를 (problems, recovered) 로 돌려준다. 각 항목은 (계정 표시명, 안내 문구)."""
+    """계정별 로그인/세션 문제를 (problems, recovered) 로 돌려준다. 각 항목은 (계정 표시명, 안내 문구). 문구에는 원인과 조치가 들어 있다."""
     problems, recovered = [], []
     for ar in getattr(result, "account_results", []) or []:
         uid = getattr(ar, "user_id", "")
         name = _mask_id(uid) if cfg.get("discord_mask_ids", True) else uid
         relogin = getattr(ar, "relogin", "") or ""
+        raw = getattr(ar, "login_error", "") or ""
         if getattr(ar, "session_expired", False):
             if relogin == "skipped":
                 text = "네이버 세션이 만료되었지만 최근 30분 안에 재로그인을 이미 시도해 이번에는 건너뛰었습니다. 링크는 처리하지 않았습니다(방문 기록 없음)."
+                raw = raw or "cooldown"
             elif relogin == "failed":
-                text = "네이버 세션이 만료되었고 자동 재로그인에 실패했습니다. 링크는 처리하지 않았습니다(방문 기록 없음). 터미널에서 `login 아이디`로 수동 로그인이 필요합니다."
+                text = "네이버 세션이 만료되었고 자동 재로그인에 실패했습니다. 링크는 처리하지 않았습니다(방문 기록 없음)."
             else:
-                text = "네이버 세션이 만료되어 링크 처리를 중단했습니다(방문 기록 없음). `login 아이디`로 수동 로그인이 필요합니다."
-            problems.append((name, text))
+                text = "네이버 세션이 만료되어 링크 처리를 중단했습니다(방문 기록 없음)."
+            problems.append((name, text + _cause_text(raw, cfg)))
         elif getattr(ar, "login_failed", False):
-            problems.append((name, "로그인에 실패했습니다(쿠키 만료 또는 캡차 가능성). `login 아이디`로 수동 로그인이 필요합니다."))
+            problems.append((name, "네이버 로그인에 실패했습니다." + _cause_text(raw, cfg)))
         elif relogin == "ok":
             recovered.append((name, "세션이 만료되어 자동으로 재로그인했습니다. 정상 처리되었습니다."))
     return problems, recovered
+
+
+# ---------------------------------------------------------------- 실행 감시 (멈춤 / 비정상 종료 알림)
+class ProgressTracker:
+    """엔진 로그가 올라올 때마다 갱신되어 '마지막 진행 시각'과 최근 로그를 보관한다."""
+
+    def __init__(self, keep=8):
+        self._lock = threading.Lock()
+        self.started = time.time()
+        self.last = self.started
+        self.lines = deque(maxlen=keep)
+
+    def log(self, message):
+        with self._lock:
+            self.last = time.time()
+            self.lines.append(f"{datetime.now():%H:%M:%S} {message}")
+
+    def snapshot(self):
+        with self._lock:
+            return self.started, self.last, list(self.lines)
+
+
+def _fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}시간 {minutes}분"
+    if minutes:
+        return f"{minutes}분 {secs}초"
+    return f"{secs}초"
+
+
+def _proc_state(pid):
+    """리눅스 /proc 에서 프로세스 상태 문자를 읽는다. 알 수 없으면 빈 문자열."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="utf-8") as f:
+            return f.read().rsplit(") ", 1)[1].split()[0]
+    except Exception:
+        return ""
+
+
+PROC_STATE_TEXT = {"R": "실행 중", "S": "대기 중(sleeping)", "D": "디스크/IO 대기", "T": "정지됨(Ctrl+Z 등)", "Z": "좀비", "t": "추적 정지"}
+
+
+def _send_alert(cfg, title, description, color):
+    url = cfg.get("discord_webhook_url")
+    if not url:
+        return False
+    embed = {
+        "title": title,
+        "description": description[:4000],
+        "color": color,
+        "footer": {"text": "naverpaper"},
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    }
+    return send_discord(url, {"embeds": [embed]})
+
+
+def _log_block(lines, cfg):
+    if not lines:
+        return ""
+    body = "\n".join(_clean_text(x, cfg)[:180] for x in lines)[-1400:]
+    return f"\n```\n{body}\n```"
+
+
+ALERT_RED, ALERT_ORANGE, ALERT_GREEN = 0xE74C3C, 0xE67E22, 0x2ECC71
+
+
+def notify_stall(cfg, kind, tracker, source="cron 실행", extra=""):
+    """kind: stall(진행 멈춤) / overtime(실행 시간 초과) / resumed(진행 재개)"""
+    started, last, lines = tracker.snapshot()
+    now = time.time()
+    elapsed, idle = now - started, now - last
+    if kind == "stall":
+        title = "네이버 폐지줍기 - 진행이 멈춘 것 같습니다"
+        desc = (
+            f"{source}에서 **{_fmt_duration(idle)}** 동안 새 로그가 없습니다. (시작 후 {_fmt_duration(elapsed)} 경과)\n"
+            "느린 사이트를 수집 중일 수도 있지만 계속되면 프로세스를 확인하세요.\n"
+            "`ps aux | grep -E \"naverpaper|chrom\" | grep -v grep`"
+        )
+        color = ALERT_RED
+    elif kind == "overtime":
+        title = "네이버 폐지줍기 - 실행 시간이 오래 걸립니다"
+        desc = f"{source}이(가) 시작된 지 **{_fmt_duration(elapsed)}** 지났지만 아직 끝나지 않았습니다. 새 실행은 이 실행이 끝날 때까지 건너뜁니다."
+        color = ALERT_ORANGE
+    else:
+        title = "네이버 폐지줍기 - 진행이 다시 시작되었습니다"
+        desc = f"{source}의 로그가 다시 올라오기 시작했습니다. (시작 후 {_fmt_duration(elapsed)} 경과) 앞선 멈춤 알림은 일시적인 지연이었습니다."
+        color = ALERT_GREEN
+    if extra:
+        desc += "\n" + extra
+    desc += "\n최근 로그:" + _log_block(lines, cfg)
+    return _send_alert(cfg, title, desc, color)
+
+
+class RunWatchdog(threading.Thread):
+    """수집이 도는 동안 별도 스레드로 감시한다. 진행(로그)이 일정 시간 없으면 '멈춤', 전체 시간이 너무 길면 '시간 초과'를 디스코드로 알린다."""
+
+    def __init__(self, cfg, tracker, source="cron 실행", state_path=None):
+        super().__init__(daemon=True, name="naverpaper-watchdog")
+        self.cfg, self.tracker, self.source = cfg, tracker, source
+        self.stall_seconds = cfg.get("stall_alert_minutes", 15) * 60
+        self.max_seconds = cfg.get("max_run_minutes", 60) * 60
+        self.interval = 30.0
+        self.state_path = state_path
+        self._stop_event = threading.Event()
+        self.stalled = False
+        self.overtime_alerted = False
+
+    def run(self):
+        while not self._stop_event.wait(self.interval):
+            try:
+                self._tick()
+            except Exception:
+                logger.exception("감시 스레드 오류")
+
+    def _tick(self):
+        now = time.time()
+        started, last, lines = self.tracker.snapshot()
+        self._write_state(started, lines)
+        if self.stall_seconds and now - last >= self.stall_seconds and not self.stalled:
+            self.stalled = True
+            logger.warning("진행이 %s 동안 없습니다 (멈춤 의심)", _fmt_duration(now - last))
+            notify_stall(self.cfg, "stall", self.tracker, self.source)
+        elif self.stalled and self.stall_seconds and now - last < self.stall_seconds:
+            self.stalled = False
+            notify_stall(self.cfg, "resumed", self.tracker, self.source)
+        if self.max_seconds and now - started >= self.max_seconds and not self.overtime_alerted:
+            self.overtime_alerted = True
+            logger.warning("실행 시간이 %s 를 넘었습니다", _fmt_duration(now - started))
+            notify_stall(self.cfg, "overtime", self.tracker, self.source)
+
+    def _write_state(self, started, lines):
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "started": started, "updated": time.time(), "source": self.source, "lines": lines}, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def stop(self):
+        self._stop_event.set()
+
+
+def run_state_path(cfg):
+    return os.path.join(cfg["data_dir"], "run_state.json")
+
+
+def begin_run_state(cfg, tracker, source):
+    """실행 시작 표시. 정상 종료하면 end_run_state 가 지우므로, 남아 있으면 비정상 종료다."""
+    try:
+        with open(run_state_path(cfg), "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "started": tracker.started, "updated": time.time(), "source": source, "lines": []}, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def end_run_state(cfg):
+    try:
+        os.remove(run_state_path(cfg))
+    except OSError:
+        pass
+
+
+def finish_run(cfg, watchdog):
+    """정상 종료 처리: 감시 스레드를 먼저 멈추고 기다린 뒤 상태 파일을 지운다 (스레드가 지운 파일을 다시 쓰는 경쟁을 막는다)."""
+    watchdog.stop()
+    if watchdog.is_alive():
+        watchdog.join(5)
+    end_run_state(cfg)
+
+
+def check_previous_abnormal_exit(cfg):
+    """이전 실행이 정상 종료되지 않았다면(서버 재부팅, 메모리 부족으로 강제 종료 등) 알린다. 락을 잡은 직후에 호출한다."""
+    path = run_state_path(cfg)
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if prev.get("pid") == os.getpid():
+        return False
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    started = prev.get("started")
+    when = datetime.fromtimestamp(started).strftime("%m-%d %H:%M") if started else "알 수 없음"
+    updated = prev.get("updated")
+    last_seen = datetime.fromtimestamp(updated).strftime("%H:%M:%S") if updated else "알 수 없음"
+    logger.warning("이전 실행(시작 %s, PID %s)이 정상 종료되지 않았습니다 (마지막 기록 %s)", when, prev.get("pid"), last_seen)
+    desc = (
+        f"이전 {prev.get('source', '실행')}(시작 {when}, PID {prev.get('pid')})이 끝나기 전에 사라졌습니다. 마지막으로 확인된 시각은 {last_seen} 입니다.\n"
+        "서버 재부팅, 메모리 부족(OOM)으로 인한 강제 종료, 수동 종료 중 하나일 수 있습니다.\n"
+        "`dmesg -T | grep -i -E \"killed process|out of memory\" | tail`"
+        + "\n마지막 로그:" + _log_block(prev.get("lines") or [], cfg)
+    )
+    return _send_alert(cfg, "네이버 폐지줍기 - 이전 실행이 비정상 종료되었습니다", desc, ALERT_RED)
+
+
+def notify_lock_held(cfg, lock, source="cron 실행"):
+    """락을 못 잡았을 때: 잡고 있는 실행이 너무 오래됐다면(멈춤 의심) 알린다. 한 시간에 한 번만."""
+    if not cfg.get("discord_webhook_url") or not (cfg.get("max_run_minutes") or cfg.get("stall_alert_minutes")):
+        return False
+    holder = getattr(lock, "holder", {}) or {}
+    started = holder.get("started")
+    if not started:
+        try:
+            started = os.path.getmtime(lock.path)
+        except OSError:
+            return False
+    age = time.time() - started
+    if age < (cfg.get("max_run_minutes") or 60) * 60:
+        return False
+    marker = os.path.join(cfg["data_dir"], "lock_alert.marker")
+    try:
+        if time.time() - os.path.getmtime(marker) < 3600:
+            return False
+    except OSError:
+        pass
+    pid = holder.get("pid")
+    state = PROC_STATE_TEXT.get(_proc_state(pid), "") if pid else ""
+    desc = (
+        f"이전 실행{f'(PID {pid})' if pid else ''}이 **{_fmt_duration(age)}** 째 끝나지 않아 이번 {source}은 건너뛰었습니다."
+        + (f"\n프로세스 상태: {state}" if state else "")
+        + "\n멈춘 것이 맞다면 종료하세요: `kill " + (str(pid) if pid else "PID") + "` 후 `pkill -f chrom` 으로 남은 브라우저를 정리하면 다음 실행부터 정상으로 돌아옵니다."
+    )
+    ok = _send_alert(cfg, "네이버 폐지줍기 - 이전 실행이 끝나지 않아 건너뜀", desc, ALERT_RED)
+    if ok:
+        try:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
+        except OSError:
+            pass
+    return ok
+
+
+def notify_crash(cfg, exc, tracker=None, source="cron 실행"):
+    """수집 도중 예외로 중단됐을 때."""
+    tb_lines = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip().splitlines()
+    desc = f"{source}이(가) 예외로 중단되었습니다.\n`{_clean_text(type(exc).__name__ + ': ' + str(exc), cfg)[:300]}`"
+    desc += "\n스택:" + _log_block(tb_lines[-6:], cfg)
+    if tracker is not None:
+        desc += "\n최근 로그:" + _log_block(tracker.snapshot()[2], cfg)
+    return _send_alert(cfg, "네이버 폐지줍기 - 수집이 예외로 중단되었습니다", desc, ALERT_RED)
 
 
 def balance_notes(result, cfg):
@@ -494,8 +818,20 @@ def cmd_run(np, cfg, args):
     lock = RunLock(os.path.join(cfg["data_dir"], "naverpaper.lock"))
     if not lock.acquire():
         logger.warning("이미 수집이 실행 중입니다. 이번 실행은 건너뜁니다.")
+        try:
+            notify_lock_held(cfg, lock)
+        except Exception:
+            logger.exception("디스코드 알림 실패")
         return EXIT_LOCKED
+    tracker = ProgressTracker()
+    watchdog = RunWatchdog(cfg, tracker, "cron 실행", state_path=run_state_path(cfg))
     try:
+        try:
+            check_previous_abnormal_exit(cfg)
+        except Exception:
+            logger.exception("이전 실행 상태 확인 실패")
+        begin_run_state(cfg, tracker, "cron 실행")
+        watchdog.start()
         seed_cookies(np, cfg, cfg["accounts"])
         run_cfg = np.RunConfig(
             db_path=os.path.join(cfg["data_dir"], "naverpaper.sqlite"),
@@ -507,7 +843,23 @@ def cmd_run(np, cfg, args):
             keep_campaign_days=cfg["keep_campaign_days"],
             keep_user_days=cfg["keep_user_days"],
         )
-        result = np.run_sync(run_cfg, log=lambda m: logger.info("%s", m))
+        def engine_log(message):
+            logger.info("%s", message)
+            tracker.log(message)
+
+        try:
+            result = np.run_sync(run_cfg, log=engine_log)
+        except KeyboardInterrupt:
+            finish_run(cfg, watchdog)  # 사용자가 직접 중단한 것은 비정상 종료로 보지 않는다
+            raise
+        except Exception as e:
+            logger.exception("수집 중 예외")
+            try:
+                notify_crash(cfg, e, tracker)
+            except Exception:
+                logger.exception("디스코드 알림 실패")
+            finish_run(cfg, watchdog)  # 이미 알렸으므로 다음 실행에서 '비정상 종료'로 중복 알리지 않는다
+            raise
         logger.info(
             "수집 종료 status=%s 수집URL=%s 건너뜀=%s 방문=%s 예상포인트=%s",
             result.status,
@@ -543,11 +895,13 @@ def cmd_run(np, cfg, args):
             notify_run(cfg, result, os.path.join(cfg["data_dir"], "naverpaper.sqlite"))
         except Exception:
             logger.exception("디스코드 알림 실패")
+        finish_run(cfg, watchdog)
         if result.status == "error":
             logger.error("수집 오류: %s", result.message)
             return EXIT_ERROR
         return EXIT_OK
     finally:
+        watchdog.stop()
         lock.release()
 
 

@@ -142,6 +142,8 @@ pip install -r requirements.txt     # 의존성이 바뀌었을 때만
 | discord_webhook_url | 디스코드 웹훅 주소 (아래 참고) |
 | discord_notify_mode | `always` 매번 전송 / `earned` 적립이 있거나 오류일 때만 전송 |
 | discord_mask_ids | true 면 아이디를 앞 3글자만 표시 (`abc•••`) |
+| stall_alert_minutes | 수집 중 새 로그가 이 시간(분) 동안 없으면 "진행 멈춤" 디스코드 알림. 기본 15, 0이면 끔 |
+| max_run_minutes | 한 번의 실행이 이 시간(분)을 넘기면 "시간 초과" 알림. 기본 60, 0이면 끔 |
 | mcp_token | MCP 서버(`naverpaper_mcp.py`) 인증 토큰. 외부 주소에 바인딩하면 필수 (7장 참고) |
 | data_dir | 쿠키·DB·로그 저장 위치 (비우면 `./data`) |
 
@@ -249,6 +251,44 @@ idB                          3         3         3           8
 
 ---
 
+### 로그인 실패 알림 (원인 포함)
+
+수집 중 네이버 로그인에 실패하거나 세션이 만료되어 처리하지 못한 계정이 있으면 디스코드로 빨간색 경고가 갑니다. 경고에는 **원인과 조치**가 함께 들어 있습니다. (`discord_notify_mode`가 `earned`여도 항상 전송됩니다.)
+
+| 원인 | 판단 근거 | 조치 안내 |
+| --- | --- | --- |
+| 캡차 요구 | 실패한 로그인 화면에 자동입력 방지 문구 | `login 아이디` 실행 (캡차 이미지가 디스코드로 전송됨) |
+| 아이디/비밀번호 불일치 | 화면의 "아이디 또는 비밀번호를 잘못 입력" 문구 | config.json 의 비밀번호 확인 |
+| 추가 인증 요구 | 2단계 인증, 본인 확인, 새 환경 확인 문구 | PC 브라우저에서 인증을 마친 뒤 `login` |
+| 계정 보호조치/이용 제한 | 보호조치, 이용 제한 문구 | 네이버에서 계정 상태 확인 |
+| 휴면 계정 | 휴면 문구 | 네이버에서 휴면 해제 |
+| 비밀번호 미설정 | `password empty` | config.json 에 비밀번호 입력 |
+| 로그인 페이지 접속 시간 초과 | 로그인 페이지 열기 실패 | 서버 네트워크, 프록시, 부하 확인 |
+| 로그인 화면 구조 변경 의심 | 아이디/비밀번호 입력칸을 못 찾음 | 로그의 `login diagnostic` 줄 확인 |
+| 재로그인 건너뜀 | 최근 30분 안에 이미 재로그인을 시도함 | 수동 로그인 또는 30분 뒤 재시도 |
+| 원인을 특정하지 못함 | 위 어느 문구에도 해당하지 않음 | 로그의 `login diagnostic - failed final_url=... body=...` 확인 |
+
+- 원인 분류는 실패한 화면의 문구로 하기 때문에 **추정**입니다. 알림에는 `원문` 도 함께 표시되고, 화면 내용은 로그의 `login diagnostic - failed ... body=...` 줄에 남습니다.
+- 수집할 새 링크가 없는 날도 쿠키를 쓸 수 없으면 수집 단계에서 로그인을 시도하므로, 로그인 문제를 놓치지 않고 알립니다.
+- 같은 실행에서 이미 로그인에 실패했다면 다시 시도하지 않습니다(캡차 반복 방지).
+
+### 실행 멈춤 / 비정상 종료 알림
+
+| 알림 | 언제 | 비고 |
+| --- | --- | --- |
+| 진행이 멈춘 것 같습니다 | 수집 중 `stall_alert_minutes`(기본 15분) 동안 새 로그가 없음 | 최근 로그 8줄 포함. 느린 사이트 수집이면 일시적일 수 있음 |
+| 진행이 다시 시작되었습니다 | 멈춤 알림 뒤 로그가 다시 올라옴 | 앞선 알림이 일시적 지연이었다는 안내 |
+| 실행 시간이 오래 걸립니다 | 한 번의 실행이 `max_run_minutes`(기본 60분) 초과 | 실행당 한 번만 |
+| 이전 실행이 끝나지 않아 건너뜀 | 이전 실행이 `max_run_minutes` 넘게 락을 잡고 있어 cron이 건너뜀 | PID, 프로세스 상태(정지됨 등), 종료 방법 안내. 1시간에 한 번만 |
+| 이전 실행이 비정상 종료되었습니다 | 이전 실행이 정상 종료 없이 사라짐(서버 재부팅, 메모리 부족 강제 종료 등) | 다음 실행 시작 때 감지. 마지막으로 확인된 로그 포함 |
+| 수집이 예외로 중단되었습니다 | 수집 중 처리되지 않은 예외 | 예외 내용과 스택 끝부분 포함 |
+
+- 멈춘 프로세스가 락을 잡고 있으면 이후 cron이 모두 건너뛰므로, 알림이 오면 안내된 PID를 `kill` 하고 `pkill -f chrom` 으로 남은 브라우저를 정리하세요.
+- "비정상 종료"는 프로세스가 갑자기 사라진 경우(`kill -9`, OOM)를 다음 실행에서 알아차리는 방식이라 **알림이 다음 실행 때 도착**합니다. 사용자가 Ctrl+C로 직접 중단한 경우나 예외로 이미 알린 경우는 비정상 종료로 보지 않습니다.
+- MCP로 실행한 수집과 링크 적립도 같은 감시를 받습니다.
+- 감시 상태는 `data/run_state.json` 에 30초마다 기록되고 정상 종료하면 지워집니다.
+- 멈춤 알림만 끄려면 `"stall_alert_minutes": 0`, 시간 초과 알림은 `"max_run_minutes": 0` 으로 설정하세요. 둘 다 0이면 락 알림도 꺼집니다.
+
 ## 6. 데이터 위치
 
 ```
@@ -262,6 +302,8 @@ idB                          3         3         3           8
     cookies/<아이디>.relogin  마지막 자동 재로그인 시각 (30분 쿨다운 판단용)
     browser_profiles/      로그인용 브라우저 프로필
     naverpaper.log         로그
+    run_state.json         실행 중 상태 (정상 종료하면 삭제, 남아 있으면 비정상 종료로 판단)
+    lock_alert.marker      락 알림 중복 방지용
 ```
 
 기존 플러그인 데이터를 이어 쓰려면 플러그인의 `data/` 폴더 내용(`naverpaper.sqlite`, `cookies/`, `browser_profiles/`)을 이 `data/`로 복사하세요.
@@ -391,6 +433,7 @@ journalctl -u naverpaper-mcp -f
 - `AccountResult`: `session_expired`, `login_failed`, `relogin` 필드 추가
 - 새 함수: `is_login_redirect`, `force_relogin`, `repair_expired_session`, `verify_session(_sync)` 와 세션 이벤트 도우미
 - `process_account`, `process_account_manual_link`: 포인트 내역 페이지로 세션을 확인하고, 만료 시 재로그인 후 한 번 재시도. 만료 상태에서는 링크를 처리하지 않고 쿠키를 덮어쓰지 않음
+- `classify_login_failure`, `password_login_on_page`: 로그인 실패 화면에서 원인(captcha 등)을 분류해 `AccountResult.login_error` 로 전달. `ensure_cookie_storage_state` 실패 사유 기록, 수집 단계에서 쿠키가 없으면 먼저 로그인 시도
 - `get_naverpay_point_balance`: 값이 나올 때까지 다시 읽고(0/실패 시 진단 로그), `AccountResult.balance_unreliable` 로 잔액을 못 믿는 경우를 표시
 - `process_campaign_links`: 링크 처리 중 로그인 화면으로 이동하면 중단하고 방문 기록을 저장하지 않음
 - `save_naver_campaign_urls`, `process_naverpay_mission_detail_source`, `process_naverpay_point_main`: 로그인 화면 이동 감지와 재로그인 후 미션 소스 재수집

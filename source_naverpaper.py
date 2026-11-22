@@ -496,6 +496,7 @@ class AccountResult:
     login_failed: bool = False  # 로그인 자체에 실패
     relogin: str = ""  # 자동 재로그인 결과: "", "ok", "failed", "skipped"
     balance_unreliable: bool = False  # 포인트 잔액을 읽지 못했거나 0 으로만 읽혀 적립액(estimated_points)을 믿기 어려움
+    login_error: str = ""  # 로그인/재로그인 실패 사유 원문 (원인 분류 태그 포함)
 
 
 def cookie_path(cookie_dir: str, nid: str) -> str:
@@ -589,6 +590,24 @@ def storage_has_required_cookies(storage_state):
     return bool(values.get("NID_AUT") and values.get("NID_SES"))
 
 
+def classify_login_failure(url: str = "", title: str = "", body: str = "") -> str:
+    """로그인에 실패한 화면(주소, 제목, 본문 앞부분)으로 원인을 분류한다.
+    captcha / wrong_credentials / verification / account_locked / dormant / unknown"""
+    text = f"{title} {body}".lower()
+    url = str(url or "").lower()
+    if any(k in text for k in ("자동입력 방지", "자동 입력 방지", "보안문자", "captcha")) or "captcha" in url:
+        return "captcha"
+    if any(k in text for k in ("아이디 또는 비밀번호", "비밀번호를 잘못", "잘못 입력", "비밀번호가 일치하지")):
+        return "wrong_credentials"
+    if any(k in text for k in ("휴면",)):
+        return "dormant"
+    if any(k in text for k in ("보호조치", "이용이 제한", "이용 제한", "일시적으로 제한", "계정이 잠", "로그인이 제한")):
+        return "account_locked"
+    if any(k in text for k in ("2단계 인증", "인증번호", "본인 확인", "본인확인", "새로운 환경", "추가 인증", "기기 등록", "새로운 기기")) or "deviceconfirm" in url:
+        return "verification"
+    return "unknown"
+
+
 async def password_login_on_page(page, account: AccountConfig, emit: Callable[[str], None]):
     if not account.password:
         emit(f"{account.user_id}: login diagnostic - password empty")
@@ -640,7 +659,9 @@ async def password_login_on_page(page, account: AccountConfig, emit: Callable[[s
     except Exception as e:
         body_text = f"body read failed: {e}"
     emit(f"{account.user_id}: login diagnostic - failed final_url={page.url} title={title} body={body_text}")
-    return False, "login did not produce required cookies"
+    reason = classify_login_failure(page.url, title, body_text)
+    emit(f"{account.user_id}: login diagnostic - failure reason={reason}")
+    return False, f"login did not produce required cookies (reason={reason})"
 
 
 KEEP_LOGIN_LABEL_RE = re.compile(r"로그인\s*상태\s*유지")
@@ -925,6 +946,7 @@ async def ensure_cookie_storage_state(
         return get_storage_state(account.user_id, session_db, cookie_dir)
 
     emit(f"{account.user_id}: cookie auto refresh failed - {refresh_message}")
+    note_session_event(account.user_id, login_failed=True, login_error=str(refresh_message)[:300])
     return None
 
 
@@ -972,8 +994,14 @@ def _apply_session_events(account_result):
     ev = session_event(account_result.user_id)
     if ev.get("relogin"):
         account_result.relogin = ev["relogin"]
+    if ev.get("login_failed") and ev.get("relogin") != "ok":
+        account_result.login_failed = True
+    if ev.get("login_error") and not account_result.login_error and ev.get("relogin") != "ok":
+        account_result.login_error = ev["login_error"]
     if ev.get("expired") and ev.get("relogin") != "ok":
         account_result.session_expired = True
+        if ev.get("relogin") in ("failed", "skipped") and ev.get("message") and not account_result.login_error:
+            account_result.login_error = ev["message"]
 
 
 def _relogin_marker(cookie_dir: str, user_id: str) -> str:
@@ -2485,9 +2513,18 @@ async def process_account(
         result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="session expired; re-login failed"))
         return result
 
+    if ev.get("login_failed") and ev.get("relogin") != "ok":
+        # 수집 단계에서 이미 로그인에 실패했다면 같은 실행에서 다시 시도하지 않는다 (캡차/보안 위험)
+        emit(f"{account.user_id}: login already failed in this run; leaving {len(campaign_links)} link(s) unvisited (not recorded)")
+        result.login_failed = True
+        result.login_error = ev.get("login_error", "")
+        result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="cookie auto refresh failed"))
+        return result
+
     storage_state = await ensure_cookie_storage_state(account, session_db, cookie_dir, login_proxy_url, emit)
     if not storage_state:
         result.login_failed = True
+        result.login_error = session_event(account.user_id).get("login_error", "")
         result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="cookie auto refresh failed"))
         return result
     os.makedirs(cookie_dir, exist_ok=True)
@@ -2514,6 +2551,7 @@ async def process_account(
                 login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
                 if not login_ok:
                     result.login_failed = True
+                    result.login_error = login_message
                     result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
                 else:
                     before_points = await get_naverpay_point_balance(page, emit, account.user_id)
@@ -2623,6 +2661,7 @@ async def process_account_manual_link(
     storage_state = await ensure_cookie_storage_state(account, session_db, cookie_dir, login_proxy_url, emit)
     if not storage_state:
         result.login_failed = True
+        result.login_error = session_event(account.user_id).get("login_error", "")
         result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message="cookie auto refresh failed"))
         return result
     os.makedirs(cookie_dir, exist_ok=True)
@@ -2673,6 +2712,7 @@ async def process_account_manual_link(
                         json.dump(new_storage, f, ensure_ascii=False, indent=2)
         else:
             result.login_failed = True
+            result.login_error = login_message
             result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message=login_message))
         await context.close()
         await browser.close()
@@ -3442,6 +3482,10 @@ async def save_naver_campaign_urls(
         emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({collector_account.user_id}): +{len(account_urls)}")
 
     if collector_account:
+        # 쿠키를 쓸 수 없으면 링크 유무와 상관없이 여기서 로그인을 시도한다 (실패하면 사유가 기록되어 알림이 간다)
+        cookie_ok, _cookie_message = check_cookie_status(collector_account.user_id, cookie_dir)
+        if not cookie_ok:
+            await ensure_cookie_storage_state(collector_account, session_db, cookie_dir, login_proxy_url, emit)
         try:
             await collect_mission_source()
         except Exception as e:
