@@ -144,11 +144,14 @@ def _summarize(result, cfg):
                 "visited": int(getattr(ar, "visited_url_count", 0) or 0),
                 "skipped": int(getattr(ar, "skipped_url_count", 0) or 0),
                 "points": int(getattr(ar, "estimated_points", 0) or 0),
+                "used_points": int(getattr(ar, "used_points", 0) or 0),
+                "balance_after": getattr(ar, "balance_after", None),
                 "session_expired": bool(getattr(ar, "session_expired", False)),
                 "login_failed": bool(getattr(ar, "login_failed", False)),
                 "relogin": getattr(ar, "relogin", "") or "",
                 "balance_unreliable": bool(getattr(ar, "balance_unreliable", False)),
                 "login_error": _scrub(getattr(ar, "login_error", "") or "", cfg)[:200],
+                "pay_terms_required": bool(getattr(ar, "pay_terms_required", False)),
             }
         )
     return {
@@ -158,6 +161,7 @@ def _summarize(result, cfg):
         "skipped_urls": int(getattr(result, "skipped_url_count", 0) or 0),
         "visited_urls": int(getattr(result, "visited_url_count", 0) or 0),
         "earned_points": int(getattr(result, "estimated_points", 0) or 0),
+        "used_points": sum(a["used_points"] for a in accounts),
         "accounts": accounts,
     }
 
@@ -332,6 +336,21 @@ def _verify(account):
     return {"accounts": rows}
 
 
+def _run_accounts(conn, run_id):
+    """한 번의 실행에 대한 계정별 적립/사용/실행 직후 잔액 (예전 DB 에 열이 없으면 0/None)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(run_account_summary)")}
+    used_col = "COALESCE(used_points, 0)" if "used_points" in cols else "0"
+    bal_col = "balance_after" if "balance_after" in cols else "NULL"
+    rows = conn.execute(
+        f"SELECT user_id, COALESCE(estimated_points, 0), {used_col}, {bal_col} FROM run_account_summary WHERE run_id=? ORDER BY id",
+        (run_id,),
+    ).fetchall()
+    return [
+        {"account": _mask(u), "points": int(p or 0), "used_points": int(x or 0), "balance_after": (int(b) if b is not None else None)}
+        for u, p, x, b in rows
+    ]
+
+
 def _recent_runs(db_path, limit):
     if not nv._db_exists(db_path):
         return []
@@ -344,10 +363,6 @@ def _recent_runs(db_path, limit):
         ).fetchall()
         out = []
         for run_id, started, finished, status, visited, points in runs:
-            per = conn.execute(
-                "SELECT user_id, COALESCE(estimated_points, 0) FROM run_account_summary WHERE run_id=? ORDER BY id",
-                (run_id,),
-            ).fetchall()
             out.append(
                 {
                     "run_id": run_id,
@@ -356,7 +371,7 @@ def _recent_runs(db_path, limit):
                     "status": status,
                     "visited_urls": int(visited or 0),
                     "earned_points": int(points or 0),
-                    "accounts": [{"account": _mask(u), "points": int(p or 0)} for u, p in per],
+                    "accounts": _run_accounts(conn, run_id),
                 }
             )
         return out
@@ -368,17 +383,20 @@ def _totals_data(runs):
     cfg = _cfg()
     db_path = _paths(cfg)["db"]
     ids = [a["user_id"] for a in cfg["accounts"]]
-    zero = {"today": 0, "d7": 0, "d30": 0, "all": 0}
     if nv._db_exists(db_path):
         stats, first, run_count = nv.points_report(db_path, ids)
     else:
-        stats, first, run_count = {uid: dict(zero) for uid in ids}, None, 0
-    total = dict(zero)
+        stats, first, run_count = {uid: nv._new_entry() for uid in ids}, None, 0
+    total = {"today": 0, "d7": 0, "d30": 0, "all": 0, "used_d30": 0, "used_all": 0}
+    total_balance, any_balance = 0, False
     accounts = []
     for uid in sorted(stats):
         e = stats[uid]
         for k in total:
-            total[k] += e[k]
+            total[k] += e.get(k, 0)
+        if e.get("balance") is not None:
+            any_balance = True
+            total_balance += e["balance"]
         accounts.append(
             {
                 "account": _mask(uid),
@@ -386,15 +404,27 @@ def _totals_data(runs):
                 "last_7_days": e["d7"],
                 "last_30_days": e["d30"],
                 "all_time": e["all"],
+                "used_last_30_days": e.get("used_d30", 0),
+                "used_all_time": e.get("used_all", 0),
+                "balance": e.get("balance"),
+                "balance_checked_at": e.get("balance_at"),
             }
         )
     return {
         "first_record": str(first)[:10] if first else None,
         "run_count": run_count,
         "accounts": accounts,
-        "total": {"today": total["today"], "last_7_days": total["d7"], "last_30_days": total["d30"], "all_time": total["all"]},
+        "total": {
+            "today": total["today"],
+            "last_7_days": total["d7"],
+            "last_30_days": total["d30"],
+            "all_time": total["all"],
+            "used_last_30_days": total["used_d30"],
+            "used_all_time": total["used_all"],
+            "balance": total_balance if any_balance else None,
+        },
         "recent_runs": _recent_runs(db_path, runs),
-        "note": "적립액은 수집 전후 네이버페이 포인트 잔액 차이로 계산한 추정값입니다.",
+        "note": "적립은 이번 달 이벤트적립 증가분(읽지 못하면 잔액 차이)으로, 사용은 잔액이 줄어든 만큼으로 계산한 추정값입니다(소멸 포인트 포함 가능). 잔액은 마지막 수집 때 확인한 값입니다.",
     }
 
 
@@ -407,6 +437,7 @@ def _latest_run(db_path):
             "SELECT id, started_at, finished_at, status, visited_url_count, estimated_points, message "
             "FROM run_history ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        accounts = _run_accounts(conn, row[0]) if row else []
     finally:
         conn.close()
     if not row:
@@ -418,6 +449,8 @@ def _latest_run(db_path):
         "status": row[3],
         "visited_urls": int(row[4] or 0),
         "earned_points": int(row[5] or 0),
+        "used_points": sum(a["used_points"] for a in accounts),
+        "accounts": accounts,
         "message": _scrub(row[6] or ""),
     }
 
@@ -592,13 +625,13 @@ async def naverpaper_status() -> dict:
 
 
 async def naverpaper_totals(runs: int = 10) -> dict:
-    """계정별 적립 합계(오늘/7일/30일/전체)와 최근 실행 내역을 돌려줍니다. runs 는 최근 실행 표시 개수(1~50)입니다."""
+    """계정별 적립 합계(오늘/7일/30일/전체), 사용한 금액(30일/전체), 마지막으로 확인한 잔액과 최근 실행 내역을 돌려줍니다. 적립은 이번 달 이벤트적립 증가분, 사용은 잔액이 줄어든 만큼의 추정값(소멸 포인트 포함 가능)입니다. 잔액은 마지막 수집 때 확인한 값이며 balance_checked_at 이 그 시각입니다. runs 는 최근 실행 표시 개수(1~50)입니다."""
     runs = max(1, min(int(runs), 50))
     return await asyncio.to_thread(_totals_data, runs)
 
 
 async def naverpaper_verify(account: str = "") -> dict:
-    """네이버에 실제로 접속해 로그인 상태를 확인합니다(계정당 약 10~20초). naverpaper_status 는 쿠키 파일의 만료일만 보지만 이 도구는 서버 세션이 살아 있는지 확인합니다. account 를 비우면 모든 계정을 확인합니다. state: alive 정상 / expired 세션 만료(수동 로그인 필요) / unknown 판단 불가."""
+    """네이버에 실제로 접속해 로그인 상태를 확인합니다(계정당 약 10~20초). naverpaper_status 는 쿠키 파일의 만료일만 보지만 이 도구는 서버 세션이 살아 있는지 확인합니다. account 를 비우면 모든 계정을 확인합니다. state: alive 정상 / expired 세션 만료(수동 로그인 필요) / terms 네이버페이 약관 미동의(해당 계정으로 pay.naver.com 에서 동의 필요) / unknown 판단 불가."""
     return await asyncio.to_thread(_verify, account)
 
 
@@ -617,7 +650,7 @@ async def naverpaper_link(url: str) -> dict:
 
 
 async def naverpaper_run_status() -> dict:
-    """실행 중이거나 마지막으로 끝난 작업(run/link)의 상태와 결과, 그리고 DB에 기록된 마지막 실행을 돌려줍니다."""
+    """실행 중이거나 마지막으로 끝난 작업(run/link)의 상태와 결과(계정별 적립, 사용, 실행 직후 잔액 포함), 그리고 DB에 기록된 마지막 실행을 돌려줍니다."""
     with _JOB_LOCK:
         job = dict(_JOB)
     cfg = _cfg()

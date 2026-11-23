@@ -10,6 +10,7 @@
   python3 naverpaper.py total           # 적립 합계(오늘/7일/30일/전체) + 최근 실행 내역
   python3 naverpaper.py notify          # 적립 합계를 디스코드로 전송 (--test: 테스트 메시지)
   python3 naverpaper.py set-points 번호 아이디 적립액 [--yes]  # 잘못 기록된 실행의 적립액 수정
+  python3 naverpaper.py clear-visits 아이디 [--all] [--yes]  # 방문 기록 삭제(링크 재시도)
   python3 naverpaper.py status          # 계정별 쿠키 파일 상태 확인(만료일 기준)
   python3 naverpaper.py verify [아이디]  # 네이버에 실제 접속해 로그인 상태 확인
   python3 naverpaper.py login <아이디>   # 캡차 등으로 자동 로그인이 막힐 때 수동 로그인
@@ -226,10 +227,19 @@ def _db_exists(db_path):
     return os.path.exists(db_path) and os.path.getsize(db_path) > 0
 
 
-def points_report(db_path, accounts=None):
-    """DB(run_account_summary)에서 계정별 오늘/7일/30일/전체 적립 합계를 구한다.
+def _new_entry():
+    return {
+        "today": 0, "d7": 0, "d30": 0, "all": 0,  # 적립
+        "used_today": 0, "used_d7": 0, "used_d30": 0, "used_all": 0,  # 사용(잔액 감소로 추정, 소멸 포함)
+        "balance": None, "balance_at": None,  # 마지막으로 확인한 잔액과 그 시각
+    }
 
-    estimated_points 는 수집 전후 네이버페이 포인트 잔액 차이(after - before)입니다.
+
+def points_report(db_path, accounts=None):
+    """DB(run_account_summary)에서 계정별 오늘/7일/30일/전체 적립·사용 합계와 마지막으로 확인한 잔액을 구한다.
+
+    적립(estimated_points)은 이벤트적립 증가분(읽지 못하면 잔액 차이), 사용(used_points)은 잔액이 줄어든 만큼의 추정값입니다.
+    예전 DB에는 used_points / balance_after 열이 없을 수 있어 있을 때만 읽습니다.
     """
     now = datetime.now()
     cutoffs = {
@@ -239,8 +249,11 @@ def points_report(db_path, accounts=None):
     }
     conn = sqlite3.connect(db_path)
     try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(run_account_summary)")}
+        used_col = "COALESCE(used_points, 0)" if "used_points" in cols else "0"
+        bal_col = "balance_after" if "balance_after" in cols else "NULL"
         rows = conn.execute(
-            "SELECT user_id, created_at, COALESCE(estimated_points, 0) FROM run_account_summary"
+            f"SELECT user_id, created_at, COALESCE(estimated_points, 0), {used_col}, {bal_col} FROM run_account_summary ORDER BY id"
         ).fetchall()
         first = conn.execute("SELECT MIN(started_at) FROM run_history").fetchone()[0]
         run_count = conn.execute("SELECT COUNT(*) FROM run_history").fetchone()[0]
@@ -248,23 +261,29 @@ def points_report(db_path, accounts=None):
         conn.close()
 
     stats = {}
-    for user_id, created_at, points in rows:
-        entry = stats.setdefault(user_id, {"today": 0, "d7": 0, "d30": 0, "all": 0})
+    for user_id, created_at, points, used, balance in rows:
+        entry = stats.setdefault(user_id, _new_entry())
         try:
             ts = datetime.fromisoformat(str(created_at))
         except Exception:
             ts = None
+        used = used or 0
         entry["all"] += points
+        entry["used_all"] += used
         if ts:
             for key, cutoff in cutoffs.items():
                 if ts >= cutoff:
                     entry[key] += points
+                    entry["used_" + key] += used
+        if balance is not None:  # id 순으로 읽으므로 마지막 값이 가장 최근
+            entry["balance"] = int(balance)
+            entry["balance_at"] = str(created_at)[:16]
     if accounts:
-        # 설정에서 빠진 옛 계정 중 적립이 한 번도 없던 계정은 합계 표에 나오지 않게 한다 (적립 기록이 있으면 유지)
-        for user_id in [u for u in stats if u not in accounts and stats[u]["all"] == 0]:
+        # 설정에서 빠진 옛 계정 중 적립/사용 기록이 한 번도 없던 계정은 합계 표에 나오지 않게 한다 (기록이 있으면 유지)
+        for user_id in [u for u in stats if u not in accounts and stats[u]["all"] == 0 and stats[u]["used_all"] == 0]:
             del stats[user_id]
         for user_id in accounts:
-            stats.setdefault(user_id, {"today": 0, "d7": 0, "d30": 0, "all": 0})
+            stats.setdefault(user_id, _new_entry())
     return stats, first, run_count
 
 
@@ -273,20 +292,30 @@ def print_points_report(db_path, accounts=None, title="적립 합계"):
         print("아직 수집 기록이 없습니다.")
         return
     stats, first, run_count = points_report(db_path, accounts)
-    total = {"today": 0, "d7": 0, "d30": 0, "all": 0}
+    total = {"today": 0, "d7": 0, "d30": 0, "all": 0, "used_d30": 0}
+    total_balance, any_balance, any_used = 0, False, False
     lines = [f"== {title} (기록 시작: {str(first)[:10] if first else '-'}, 총 {run_count}회 실행) =="]
-    lines.append(f"{'계정':<20}{'오늘':>10}{'7일':>10}{'30일':>10}{'전체':>12}")
+    lines.append(f"{'계정':<20}{'오늘':>10}{'7일':>10}{'30일':>10}{'전체':>12}{'사용(30일)':>12}{'잔액':>10}")
     for user_id in sorted(stats):
         e = stats[user_id]
         for k in total:
-            total[k] += e[k]
+            total[k] += e.get(k, 0)
+        any_used = any_used or e.get("used_all", 0) > 0
+        balance = e.get("balance")
+        if balance is not None:
+            any_balance = True
+            total_balance += balance
         lines.append(
             f"{user_id:<20}{_fmt_point(e['today']):>10}{_fmt_point(e['d7']):>10}{_fmt_point(e['d30']):>10}{_fmt_point(e['all']):>12}"
+            f"{_fmt_point(e.get('used_d30', 0)):>12}{(_fmt_point(balance) if balance is not None else '-'):>10}"
         )
     if len(stats) > 1:
         lines.append(
             f"{'합계':<20}{_fmt_point(total['today']):>10}{_fmt_point(total['d7']):>10}{_fmt_point(total['d30']):>10}{_fmt_point(total['all']):>12}"
+            f"{_fmt_point(total['used_d30']):>12}{(_fmt_point(total_balance) if any_balance else '-'):>10}"
         )
+    if any_used:
+        lines.append("* 사용은 잔액이 줄어든 만큼으로 추정한 값이며 소멸된 포인트가 포함될 수 있습니다. 잔액은 마지막 수집 때 확인한 값입니다.")
     text = "\n".join(lines)
     print(text)
     for line in lines:
@@ -306,11 +335,13 @@ def print_recent_runs(db_path, limit):
         print(f"\n== 최근 {len(runs)}회 실행 ==")
         print(f"{'번호':>5} {'시작 시각':<20}{'상태':<12}{'방문':>6}{'적립':>10}   계정별")
         for run_id, started, status, visited, points in runs:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(run_account_summary)")}
+            used_col = "COALESCE(used_points,0)" if "used_points" in cols else "0"
             per = conn.execute(
-                "SELECT user_id, COALESCE(estimated_points,0) FROM run_account_summary WHERE run_id=? ORDER BY id",
+                f"SELECT user_id, COALESCE(estimated_points,0), {used_col} FROM run_account_summary WHERE run_id=? ORDER BY id",
                 (run_id,),
             ).fetchall()
-            detail = ", ".join(f"{u} +{_fmt_point(p)}" for u, p in per)
+            detail = ", ".join(f"{u} +{_fmt_point(p)}" + (f" (사용 -{_fmt_point(x)})" if x else "") for u, p, x in per)
             print(f"{run_id:>5} {str(started)[:19]:<20}{str(status):<12}{visited or 0:>6}{_fmt_point(points):>10}   {detail}")
     finally:
         conn.close()
@@ -412,51 +443,68 @@ def notify_captcha(cfg, user_id, image_bytes, hint="", status=""):
     return send_discord_image(url, payload, image_bytes, "captcha.png")
 
 
-def build_embed(cfg, title, stats, run_points=None, error_message="", notes=None, alert=False):
-    """run_points: {계정: 이번 실행 적립}. None 이면 합계 요약(notify)용."""
+def build_embed(cfg, title, stats, run_points=None, error_message="", notes=None, alert=False, run_used=None):
+    """run_points: {계정: 이번 실행 적립}, run_used: {계정: 이번 실행에서 확인된 사용 금액}. run_points 가 None 이면 합계 요약(notify)용."""
     lines = []
-    totals = {"today": 0, "d7": 0, "d30": 0, "all": 0}
+    totals = {"today": 0, "d7": 0, "d30": 0, "all": 0, "used_d30": 0}
+    total_balance, any_balance = 0, False
     for user_id in sorted(stats):
         e = stats[user_id]
         for k in totals:
-            totals[k] += e[k]
+            totals[k] += e.get(k, 0)
         name = _mask_id(user_id) if cfg["discord_mask_ids"] else user_id
         if run_points is not None:
-            lines.append(
-                f"**{name}**  이번 +{_fmt_point(run_points.get(user_id, 0))} · 오늘 {_fmt_point(e['today'])} · 전체 {_fmt_point(e['all'])}"
-            )
+            parts = [f"이번 +{_fmt_point(run_points.get(user_id, 0))}"]
+            used = (run_used or {}).get(user_id, 0)
+            if used > 0:
+                parts.append(f"사용 -{_fmt_point(used)}")
+            parts += [f"오늘 {_fmt_point(e['today'])}", f"전체 {_fmt_point(e['all'])}"]
         else:
-            lines.append(
-                f"**{name}**  오늘 {_fmt_point(e['today'])} · 7일 {_fmt_point(e['d7'])} · 전체 {_fmt_point(e['all'])}"
-            )
+            parts = [f"오늘 {_fmt_point(e['today'])}", f"7일 {_fmt_point(e['d7'])}", f"전체 {_fmt_point(e['all'])}"]
+            if e.get("used_d30", 0) > 0:
+                parts.append(f"사용(30일) -{_fmt_point(e['used_d30'])}")
+        balance = e.get("balance")
+        if balance is not None:
+            any_balance = True
+            total_balance += balance
+            parts.append(f"잔액 {_fmt_point(balance)}")
+        lines.append(f"**{name}**  " + " · ".join(parts))
 
     run_total = sum(run_points.values()) if run_points is not None else None
+    run_used_total = sum((run_used or {}).values())
     if error_message:
         color = 0xE74C3C
         head = f"수집 중 오류: {error_message[:300]}"
     elif alert:
         color = 0xE74C3C
-        head = "**로그인 문제가 있어 확인이 필요합니다.**"
+        head = "**계정 확인이 필요합니다.**"
     elif run_total is not None and run_total > 0:
         color = 0x2ECC71
         head = f"이번 실행 적립 **+{_fmt_point(run_total)}**"
     else:
         color = 0x95A5A6
         head = f"이번 실행 적립 **+{_fmt_point(run_total)}**" if run_total is not None else "적립 합계"
+    if run_total is not None and run_used_total > 0 and not error_message and not alert:
+        head += f" · 사용 -{_fmt_point(run_used_total)}"
 
     description = head + "\n\n" + "\n".join(lines)
     if notes:
         description += "\n\n" + "\n".join(notes)
     description = description[:4000]
+    fields = [
+        {"name": "오늘", "value": _fmt_point(totals["today"]), "inline": True},
+        {"name": "30일", "value": _fmt_point(totals["d30"]), "inline": True},
+        {"name": "전체", "value": _fmt_point(totals["all"]), "inline": True},
+    ]
+    if totals["used_d30"] > 0:
+        fields.append({"name": "사용(30일)", "value": "-" + _fmt_point(totals["used_d30"]), "inline": True})
+    if any_balance:
+        fields.append({"name": "현재 잔액", "value": _fmt_point(total_balance), "inline": True})
     return {
         "title": title,
         "description": description,
         "color": color,
-        "fields": [
-            {"name": "오늘", "value": _fmt_point(totals["today"]), "inline": True},
-            {"name": "30일", "value": _fmt_point(totals["d30"]), "inline": True},
-            {"name": "전체", "value": _fmt_point(totals["all"]), "inline": True},
-        ],
+        "fields": fields,
         "footer": {"text": "naverpaper"},
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
     }
@@ -518,7 +566,15 @@ def account_issues(result, cfg):
         name = _mask_id(uid) if cfg.get("discord_mask_ids", True) else uid
         relogin = getattr(ar, "relogin", "") or ""
         raw = getattr(ar, "login_error", "") or ""
-        if getattr(ar, "session_expired", False):
+        if getattr(ar, "pay_terms_required", False):
+            problems.append(
+                (
+                    name,
+                    "네이버페이 이용약관 동의가 필요해 링크를 처리하지 않았습니다(방문 기록 없음). 원인: 이 계정은 네이버페이 약관에 아직 동의하지 않아 포인트 화면 대신 가입 화면이 나옵니다. "
+                    "조치: 해당 계정으로 pay.naver.com 에 접속해 약관에 직접 동의한 뒤 다음 실행을 기다리세요.",
+                )
+            )
+        elif getattr(ar, "session_expired", False):
             if relogin == "skipped":
                 text = "네이버 세션이 만료되었지만 최근 30분 안에 재로그인을 이미 시도해 이번에는 건너뛰었습니다. 링크는 처리하지 않았습니다(방문 기록 없음)."
                 raw = raw or "cooldown"
@@ -808,8 +864,11 @@ def notify_run(cfg, result, db_path):
     for ar in getattr(result, "account_results", []) or []:
         run_points[getattr(ar, "user_id", "")] = int(getattr(ar, "estimated_points", 0) or 0)
     notes = [f"[경고] **{n}** {t}" for n, t in problems] + [f"[알림] **{n}** {t}" for n, t in recovered] + unreliable
-    title = "네이버 폐지줍기 - 로그인 확인 필요" if problems else "네이버 폐지줍기 결과"
-    embed = build_embed(cfg, title, stats, run_points, result.message if is_error else "", notes=notes, alert=bool(problems))
+    title = "네이버 폐지줍기 - 계정 확인 필요" if problems else "네이버 폐지줍기 결과"
+    run_used = {uid: 0 for uid in account_ids}
+    for ar in getattr(result, "account_results", []) or []:
+        run_used[getattr(ar, "user_id", "")] = int(getattr(ar, "used_points", 0) or 0)
+    embed = build_embed(cfg, title, stats, run_points, result.message if is_error else "", notes=notes, alert=bool(problems), run_used=run_used)
     if send_discord(url, {"embeds": [embed]}):
         logger.info("디스코드 알림 전송 완료")
 
@@ -939,7 +998,7 @@ def cmd_verify(np, cfg, args):
         logger.error("config.json 에 없는 계정입니다: %s", args.user_id)
         return EXIT_CONFIG
     cookie_dir = os.path.join(cfg["data_dir"], "cookies")
-    labels = {"alive": "OK", "expired": "NG", "unknown": "??"}
+    labels = {"alive": "OK", "expired": "NG", "terms": "!!", "unknown": "??"}
     code = EXIT_OK
     for acc in targets:
         account = np.AccountConfig(user_id=acc["user_id"], password=acc["password"], keep_login=acc["keep_login"])
@@ -993,6 +1052,49 @@ def cmd_set_points(np, cfg, args):
             )
             conn.commit()
             print(f"수정했습니다. (백업: {backup})")
+            return EXIT_OK
+        finally:
+            conn.close()
+    finally:
+        lock.release()
+
+
+def cmd_clear_visits(np, cfg, args):
+    """계정의 방문 기록을 지워 링크를 다시 시도하게 한다 (적립 없이 방문 기록만 남은 경우: 로그인 풀림, 약관 미동의 등)."""
+    import shutil
+
+    db_path = os.path.join(cfg["data_dir"], "naverpaper.sqlite")
+    if not _db_exists(db_path):
+        logger.error("DB가 없습니다: %s", db_path)
+        return EXIT_CONFIG
+    lock = RunLock(os.path.join(cfg["data_dir"], "naverpaper.lock"))
+    if not lock.acquire():
+        logger.error("수집이 실행 중입니다. 끝난 뒤 다시 실행하세요.")
+        return EXIT_LOCKED
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            where, params = "user_id=?", [args.user_id]
+            scope = "전체"
+            if not args.all:
+                where += " AND visited_at >= date('now','localtime')"
+                scope = "오늘"
+            count = conn.execute(f"SELECT COUNT(*) FROM url_visits WHERE {where}", params).fetchone()[0]
+            print(f"{args.user_id}: {scope} 방문 기록 {count}건")
+            if count == 0:
+                return EXIT_OK
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    logger.error("확인 입력이 필요합니다. 터미널에서 실행하거나 --yes 를 붙이세요.")
+                    return EXIT_ERROR
+                if input("삭제할까요? (y/N) ").strip().lower() not in ("y", "yes"):
+                    print("취소했습니다.")
+                    return EXIT_OK
+            backup = f"{db_path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
+            shutil.copy2(db_path, backup)
+            conn.execute(f"DELETE FROM url_visits WHERE {where}", params)
+            conn.commit()
+            print(f"{count}건을 삭제했습니다. (백업: {backup}) 다음 실행에서 해당 링크를 다시 시도합니다.")
             return EXIT_OK
         finally:
             conn.close()
@@ -1128,6 +1230,10 @@ def main():
     p_setp.add_argument("user_id")
     p_setp.add_argument("points", type=int)
     p_setp.add_argument("--yes", action="store_true", help="확인 질문 없이 진행")
+    p_clear = sub.add_parser("clear-visits", help="계정의 방문 기록 삭제 (기본: 오늘 것만)")
+    p_clear.add_argument("user_id")
+    p_clear.add_argument("--all", action="store_true", help="오늘뿐 아니라 전체 기록 삭제")
+    p_clear.add_argument("--yes", action="store_true", help="확인 질문 없이 진행")
     p_verify = sub.add_parser("verify", help="네이버에 실제 접속해 로그인 상태 확인")
     p_verify.add_argument("user_id", nargs="?", default="")
     p_login = sub.add_parser("login", help="수동 로그인(캡차 대응)")
@@ -1152,7 +1258,7 @@ def main():
         logger.error("pip install -r requirements.txt && playwright install chromium")
         return EXIT_CONFIG
 
-    handlers = {"run": cmd_run, "set-points": cmd_set_points, "verify": cmd_verify, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
+    handlers = {"run": cmd_run, "clear-visits": cmd_clear_visits, "set-points": cmd_set_points, "verify": cmd_verify, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
     try:
         return handlers[command](np, cfg, args)
     except KeyboardInterrupt:

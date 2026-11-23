@@ -138,6 +138,8 @@ class RunAccountSummary(Base):
     skipped_url_count = Column(Integer, default=0)
     visited_url_count = Column(Integer, default=0)
     estimated_points = Column(Integer, default=0)
+    used_points = Column(Integer, default=0)  # 잔액 감소로 추정한 사용(소멸 포함) 금액
+    balance_after = Column(Integer, nullable=True)  # 실행 직후 확인한 포인트 잔액
     detail_count = Column(Integer, default=0)
     message = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.now)
@@ -163,6 +165,10 @@ class Database:
             existing = {row[1] for row in conn.execute(text("PRAGMA table_info(run_account_summary)"))}
             if existing and "target_url_count" not in existing:
                 conn.execute(text("ALTER TABLE run_account_summary ADD COLUMN target_url_count INTEGER DEFAULT 0"))
+            if existing and "used_points" not in existing:
+                conn.execute(text("ALTER TABLE run_account_summary ADD COLUMN used_points INTEGER DEFAULT 0"))
+            if existing and "balance_after" not in existing:
+                conn.execute(text("ALTER TABLE run_account_summary ADD COLUMN balance_after INTEGER"))
 
     @contextmanager
     def get_session(self):
@@ -340,6 +346,8 @@ async def run(config: RunConfig, log: Optional[Callable[[str], None]] = None) ->
                         skipped_url_count=account_result.skipped_url_count,
                         visited_url_count=account_result.visited_url_count,
                         estimated_points=account_result.estimated_points,
+                        used_points=getattr(account_result, "used_points", 0),
+                        balance_after=getattr(account_result, "balance_after", None),
                         detail_count=len(account_result.details),
                         message=account_result.message if hasattr(account_result, "message") else "",
                     )
@@ -442,6 +450,8 @@ async def run_manual_link(
                         skipped_url_count=account_result.skipped_url_count,
                         visited_url_count=account_result.visited_url_count,
                         estimated_points=account_result.estimated_points,
+                        used_points=getattr(account_result, "used_points", 0),
+                        balance_after=getattr(account_result, "balance_after", None),
                         detail_count=len(account_result.details),
                         message=account_result.message if hasattr(account_result, "message") else "",
                     )
@@ -497,6 +507,9 @@ class AccountResult:
     relogin: str = ""  # 자동 재로그인 결과: "", "ok", "failed", "skipped"
     balance_unreliable: bool = False  # 포인트 잔액을 읽지 못했거나 0 으로만 읽혀 적립액(estimated_points)을 믿기 어려움
     login_error: str = ""  # 로그인/재로그인 실패 사유 원문 (원인 분류 태그 포함)
+    pay_terms_required: bool = False  # 네이버페이 이용약관에 동의하지 않은 계정 (포인트 화면 대신 가입 화면이 나옴)
+    used_points: int = 0  # 마지막 확인 이후 잔액이 줄어든 금액 (사용 또는 소멸, 추정)
+    balance_after: Optional[int] = None  # 실행 직후 확인한 잔액 (믿을 수 있을 때만)
 
 
 def cookie_path(cookie_dir: str, nid: str) -> str:
@@ -1094,6 +1107,35 @@ def _compute_estimated_points(cookie_dir: str, user_id: str, before, after, emit
     return estimated, reliable
 
 
+def _balance_trusted(summary: dict) -> bool:
+    """잔액을 믿을 수 있는가. 0 은 로딩 전 기본값일 수 있어, 이번 달 적립 요약까지 함께 읽혔을 때만 실제 0 으로 본다."""
+    balance = summary.get("balance")
+    return balance is not None and (balance > 0 or summary.get("month_total") is not None)
+
+
+def _evaluate_run_points(cookie_dir: str, user_id: str, before: dict, after: dict, emit: Callable[[str], None]) -> dict:
+    """이번 실행의 적립액과 사용 금액, 실행 직후 잔액을 계산한다.
+
+    사용(소멸 포함) 금액은 잔액이 줄어든 만큼이다.
+      1) 마지막으로 확인한 잔액보다 실행 직전 잔액이 낮으면 그 차이 (지난 확인 이후 ~ 이번 실행 전에 쓴 금액)
+      2) 실행 중 잔액이 줄었다면 그 차이
+    적립이 섞여 있을 수 있어 실제 사용액보다 작게 잡힐 수 있는 추정값이며, 로딩 값으로 보이는 0 은 사용으로 세지 않는다."""
+    last_balance = load_last_balance(cookie_dir, user_id)
+    earned, reliable, used_event = _compute_earned_points(cookie_dir, user_id, before, after, emit)
+    b, a = before.get("balance"), after.get("balance")
+    used = 0
+    if _balance_trusted(before) and last_balance is not None and b < last_balance:
+        used += last_balance - b
+    if _balance_trusted(before) and _balance_trusted(after) and a < b:
+        used += b - a
+    if used > 0:
+        emit(f"{user_id}: points used since the last check: -{used} (balance {last_balance if last_balance is not None else b} -> {a})")
+    balance_after = a if _balance_trusted(after) else None
+    if balance_after == 0:
+        save_last_balance(cookie_dir, user_id, 0)  # 실제 0 이면 기준도 0 으로 (이후 적립을 정확히 계산)
+    return {"earned": earned, "reliable": reliable, "used_event": used_event, "used": used, "balance_after": balance_after}
+
+
 def _mark_balance_reliability(result, before_points, after_points, emit):
     """잔액을 못 읽었거나 앞뒤가 모두 0이면 적립액 계산을 믿을 수 없다고 표시한다 (앱 알림과 리포트가 어긋나는 경우의 단서)."""
     if before_points is None or after_points is None or (before_points == 0 and after_points == 0):
@@ -1209,7 +1251,7 @@ async def repair_expired_session(account: AccountConfig, session_db, cookie_dir:
 
 
 async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_url: str = "", emit: Optional[Callable[[str], None]] = None):
-    """저장된 쿠키로 네이버페이에 실제 접속해 로그인 상태를 확인한다. (state, detail) — state: alive / expired / unknown"""
+    """저장된 쿠키로 네이버페이에 실제 접속해 로그인 상태를 확인한다. (state, detail) — state: alive / expired / terms(약관 미동의) / unknown"""
     from playwright.async_api import async_playwright
     from playwright_stealth import Stealth
 
@@ -1237,6 +1279,8 @@ async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_u
             points = summary["balance"]
             if is_login_redirect(page.url):
                 return "expired", "redirected to login (server-side session is no longer valid)"
+            if summary.get("terms_required"):
+                return "terms", "Naver Pay terms agreement required (open pay.naver.com with this account and agree to the terms)"
             if points is None:
                 return "unknown", "point balance unreadable (page did not load as expected)"
             if points > 0:
@@ -2683,7 +2727,12 @@ async def process_account(
                 else:
                     before_summary = await get_naverpay_point_summary(page, emit, account.user_id)
                     before_points = before_summary["balance"]
-                    if is_login_redirect(page.url):
+                    if before_summary.get("terms_required"):
+                        # 약관에 동의하지 않은 계정은 적립이 되지 않으므로, 링크를 처리하면 방문 기록만 남는다
+                        emit(f"{account.user_id}: Naver Pay terms agreement is required; leaving {len(campaign_links)} link(s) unvisited (not recorded)")
+                        result.pay_terms_required = True
+                        result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="naver pay terms agreement required"))
+                    elif is_login_redirect(page.url):
                         # 쿠키 파일은 유효해 보여도 서버에서 세션이 무효화된 상태
                         emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
                         note_session_event(account.user_id, expired=True)
@@ -2697,10 +2746,13 @@ async def process_account(
                         result.details.extend(details)
                         result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                         result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
-                        result.estimated_points, baseline_ok, used_event = _compute_earned_points(cookie_dir, account.user_id, before_summary, after_summary, emit)
-                        if not used_event:
+                        evaluated = _evaluate_run_points(cookie_dir, account.user_id, before_summary, after_summary, emit)
+                        result.estimated_points = evaluated["earned"]
+                        result.used_points = evaluated["used"]
+                        result.balance_after = evaluated["balance_after"]
+                        if not evaluated["used_event"]:
                             _mark_balance_reliability(result, before_points, after_points, emit)
-                        if not baseline_ok:
+                        if not evaluated["reliable"]:
                             result.balance_unreliable = True
                         if any(x.status == "login_error" for x in details):
                             result.session_expired = True
@@ -2774,11 +2826,17 @@ def _parse_point_benefits(lines):
     return {"event": event, "month_total": month_total, "month": month}
 
 
+def _is_pay_terms_page(lines) -> bool:
+    """네이버페이 가입(이용약관 동의) 화면인지: '네이버페이로 시작하세요', '약관 모두 동의하기' 문구가 있고 '내 포인트'는 없음."""
+    head = " ".join(lines[:80])
+    return ("약관 모두 동의하기" in head or "네이버페이로 시작하세요" in head) and "내 포인트" not in lines
+
+
 async def get_naverpay_point_summary(page, emit: Optional[Callable[[str], None]] = None, label: str = "", want_event: bool = True) -> dict:
     """네이버페이 포인트 화면에서 잔액과 이번 달 이벤트적립 금액을 읽는다.
     반환: {"balance": int|None, "event": int|None, "month_total": int|None, "month": "YYYY-MM"|""}
     로딩 중에는 '0원' 같은 기본값이 보일 수 있어, 0보다 큰 잔액(그리고 want_event 이면 이벤트적립)이 나올 때까지 다시 읽는다."""
-    summary = {"balance": None, "event": None, "month_total": None, "month": ""}
+    summary = {"balance": None, "event": None, "month_total": None, "month": "", "terms_required": False}
     value, idx, lines = None, -1, []
     seen_at = None
     try:
@@ -2790,6 +2848,9 @@ async def get_naverpay_point_summary(page, emit: Optional[Callable[[str], None]]
             lines = [x.strip() for x in body.splitlines() if x.strip()]
             value, idx = _parse_point_balance(lines)
             summary.update(_parse_point_benefits(lines))
+            if value is None and _is_pay_terms_page(lines):
+                summary["terms_required"] = True
+                break  # 가입 화면이므로 더 기다려도 잔액은 나오지 않는다
             if value is not None and value > 0:
                 if seen_at is None:
                     seen_at = time.time()
@@ -2805,6 +2866,10 @@ async def get_naverpay_point_summary(page, emit: Optional[Callable[[str], None]]
             emit(f"{label}: point balance read error - {e}")
         return summary
     summary["balance"] = value
+    if summary["terms_required"]:
+        if emit:
+            emit(f"{label}: Naver Pay terms agreement page detected (this account has not agreed to the Naver Pay terms yet)")
+        return summary
     if emit:
         sample = lines[idx : idx + 8] if idx >= 0 else lines[:12]
         emit(f"{label}: point balance diagnostic - value={value} lines near '내 포인트'={sample}")
@@ -2860,7 +2925,11 @@ async def process_account_manual_link(
         if login_ok:
             before_summary = await get_naverpay_point_summary(page, emit, account.user_id)
             before_points = before_summary["balance"]
-            if is_login_redirect(page.url):
+            if before_summary.get("terms_required"):
+                emit(f"{account.user_id}: Naver Pay terms agreement is required; the link was not processed (not recorded)")
+                result.pay_terms_required = True
+                result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message="naver pay terms agreement required"))
+            elif is_login_redirect(page.url):
                 emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
                 note_session_event(account.user_id, expired=True)
                 expired = True
@@ -2871,10 +2940,13 @@ async def process_account_manual_link(
                 result.details.extend(details)
                 result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                 result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
-                result.estimated_points, baseline_ok, used_event = _compute_earned_points(cookie_dir, account.user_id, before_summary, after_summary, emit)
-                if not used_event:
+                evaluated = _evaluate_run_points(cookie_dir, account.user_id, before_summary, after_summary, emit)
+                result.estimated_points = evaluated["earned"]
+                result.used_points = evaluated["used"]
+                result.balance_after = evaluated["balance_after"]
+                if not evaluated["used_event"]:
                     _mark_balance_reliability(result, before_points, after_points, emit)
-                if not baseline_ok:
+                if not evaluated["reliable"]:
                     result.balance_unreliable = True
                 if any(x.status == "login_error" for x in details):
                     result.session_expired = True
