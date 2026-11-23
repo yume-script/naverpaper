@@ -9,6 +9,7 @@
   python3 naverpaper.py run
   python3 naverpaper.py total           # 적립 합계(오늘/7일/30일/전체) + 최근 실행 내역
   python3 naverpaper.py notify          # 적립 합계를 디스코드로 전송 (--test: 테스트 메시지)
+  python3 naverpaper.py set-points 번호 아이디 적립액 [--yes]  # 잘못 기록된 실행의 적립액 수정
   python3 naverpaper.py status          # 계정별 쿠키 파일 상태 확인(만료일 기준)
   python3 naverpaper.py verify [아이디]  # 네이버에 실제 접속해 로그인 상태 확인
   python3 naverpaper.py login <아이디>   # 캡차 등으로 자동 로그인이 막힐 때 수동 로그인
@@ -303,14 +304,14 @@ def print_recent_runs(db_path, limit):
             (limit,),
         ).fetchall()
         print(f"\n== 최근 {len(runs)}회 실행 ==")
-        print(f"{'시작 시각':<20}{'상태':<12}{'방문':>6}{'적립':>10}   계정별")
+        print(f"{'번호':>5} {'시작 시각':<20}{'상태':<12}{'방문':>6}{'적립':>10}   계정별")
         for run_id, started, status, visited, points in runs:
             per = conn.execute(
                 "SELECT user_id, COALESCE(estimated_points,0) FROM run_account_summary WHERE run_id=? ORDER BY id",
                 (run_id,),
             ).fetchall()
             detail = ", ".join(f"{u} +{_fmt_point(p)}" for u, p in per)
-            print(f"{str(started)[:19]:<20}{str(status):<12}{visited or 0:>6}{_fmt_point(points):>10}   {detail}")
+            print(f"{run_id:>5} {str(started)[:19]:<20}{str(status):<12}{visited or 0:>6}{_fmt_point(points):>10}   {detail}")
     finally:
         conn.close()
 
@@ -951,6 +952,54 @@ def cmd_verify(np, cfg, args):
     return code
 
 
+def cmd_set_points(np, cfg, args):
+    """잘못 기록된 실행의 적립액을 바로잡는다 (예: 잔액을 잘못 읽어 전체 잔액이 한 번에 적립된 것으로 기록된 경우)."""
+    import shutil
+
+    db_path = os.path.join(cfg["data_dir"], "naverpaper.sqlite")
+    if not _db_exists(db_path):
+        logger.error("DB가 없습니다: %s", db_path)
+        return EXIT_CONFIG
+    if args.points < 0:
+        logger.error("적립액은 0 이상이어야 합니다")
+        return EXIT_CONFIG
+    lock = RunLock(os.path.join(cfg["data_dir"], "naverpaper.lock"))
+    if not lock.acquire():
+        logger.error("수집이 실행 중입니다. 끝난 뒤 다시 실행하세요.")
+        return EXIT_LOCKED
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            row = conn.execute(
+                "SELECT id, estimated_points FROM run_account_summary WHERE run_id=? AND user_id=?", (args.run_id, args.user_id)
+            ).fetchone()
+            if not row:
+                logger.error("해당 실행/계정의 기록이 없습니다 (run_id=%s, 아이디=%s). `total` 의 번호와 아이디를 확인하세요.", args.run_id, args.user_id)
+                return EXIT_CONFIG
+            print(f"실행 {args.run_id} / {args.user_id}: 적립 {_fmt_point(row[1])} -> {_fmt_point(args.points)}")
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    logger.error("확인 입력이 필요합니다. 터미널에서 실행하거나 --yes 를 붙이세요.")
+                    return EXIT_ERROR
+                if input("이 값으로 바꿀까요? (y/N) ").strip().lower() not in ("y", "yes"):
+                    print("취소했습니다.")
+                    return EXIT_OK
+            backup = f"{db_path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
+            shutil.copy2(db_path, backup)
+            conn.execute("UPDATE run_account_summary SET estimated_points=? WHERE id=?", (args.points, row[0]))
+            conn.execute(
+                "UPDATE run_history SET estimated_points=(SELECT COALESCE(SUM(estimated_points),0) FROM run_account_summary WHERE run_id=?) WHERE id=?",
+                (args.run_id, args.run_id),
+            )
+            conn.commit()
+            print(f"수정했습니다. (백업: {backup})")
+            return EXIT_OK
+        finally:
+            conn.close()
+    finally:
+        lock.release()
+
+
 def cmd_status(np, cfg, args):
     cookie_dir = os.path.join(cfg["data_dir"], "cookies")
     for acc in cfg["accounts"]:
@@ -1074,6 +1123,11 @@ def main():
     p_total.add_argument("-n", "--runs", type=int, default=10, help="최근 실행 표시 개수 (기본 10)")
     p_notify = sub.add_parser("notify", help="적립 합계를 디스코드로 전송 (수집 없음)")
     p_notify.add_argument("--test", action="store_true", help="테스트 메시지만 전송")
+    p_setp = sub.add_parser("set-points", help="잘못 기록된 실행의 적립액 수정 (total 의 번호 사용)")
+    p_setp.add_argument("run_id", type=int)
+    p_setp.add_argument("user_id")
+    p_setp.add_argument("points", type=int)
+    p_setp.add_argument("--yes", action="store_true", help="확인 질문 없이 진행")
     p_verify = sub.add_parser("verify", help="네이버에 실제 접속해 로그인 상태 확인")
     p_verify.add_argument("user_id", nargs="?", default="")
     p_login = sub.add_parser("login", help="수동 로그인(캡차 대응)")
@@ -1098,7 +1152,7 @@ def main():
         logger.error("pip install -r requirements.txt && playwright install chromium")
         return EXIT_CONFIG
 
-    handlers = {"run": cmd_run, "verify": cmd_verify, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
+    handlers = {"run": cmd_run, "set-points": cmd_set_points, "verify": cmd_verify, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
     try:
         return handlers[command](np, cfg, args)
     except KeyboardInterrupt:

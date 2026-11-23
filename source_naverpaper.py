@@ -980,6 +980,52 @@ def note_session_event(user_id, **values):
     _SESSION_EVENTS.setdefault(str(user_id or ""), {}).update(values)
 
 
+def _balance_file(cookie_dir: str, user_id: str) -> str:
+    return os.path.join(cookie_dir, f"{user_id}.balance.json")
+
+
+def load_last_balance(cookie_dir: str, user_id: str) -> Optional[int]:
+    """마지막으로 확인한 포인트 잔액 (없으면 None)."""
+    try:
+        with open(_balance_file(cookie_dir, user_id), encoding="utf-8") as f:
+            value = json.load(f).get("balance")
+        return int(value) if value is not None else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_last_balance(cookie_dir: str, user_id: str, balance: int):
+    try:
+        os.makedirs(cookie_dir, exist_ok=True)
+        with open(_balance_file(cookie_dir, user_id), "w", encoding="utf-8") as f:
+            json.dump({"balance": int(balance), "at": datetime.now().isoformat(timespec="seconds")}, f)
+    except OSError:
+        pass
+
+
+def _compute_estimated_points(cookie_dir: str, user_id: str, before, after, emit: Callable[[str], None]):
+    """수집 전후 잔액으로 이번 실행의 적립액을 계산한다. (적립액, 기준 신뢰 여부)
+
+    실행 직전 잔액이 로딩 전 기본값 0 으로 읽히면 '직후 잔액 - 0' 이 되어 지금까지 모은 전체 잔액이 이번 실행 한 번의
+    적립으로 기록된다. 이를 막기 위해 마지막으로 확인한 잔액을 기준으로 삼고, 기준이 없으면 적립액을 세지 않는다."""
+    if before is None or after is None:
+        return 0, False  # 읽지 못함: 호출부의 _mark_balance_reliability 가 경고한다
+    last = load_last_balance(cookie_dir, user_id)
+    baseline, note, reliable = before, "", True
+    if before == 0 and after > 0:
+        if last is None:
+            baseline, reliable = after, False
+            note = " [no baseline yet: balance before the run read as 0, so the earned amount is not counted]"
+        elif last > 0:
+            baseline = last
+            note = f" [baseline {last} used: balance before the run read as 0]"
+    estimated = max(0, after - baseline)
+    emit(f"{user_id}: point balance {before} -> {after} (+{estimated}){note}")
+    if after > 0:  # 0 은 로딩 값일 수 있어 기준으로 저장하지 않는다
+        save_last_balance(cookie_dir, user_id, after)
+    return estimated, reliable
+
+
 def _mark_balance_reliability(result, before_points, after_points, emit):
     """잔액을 못 읽었거나 앞뒤가 모두 0이면 적립액 계산을 믿을 수 없다고 표시한다 (앱 알림과 리포트가 어긋나는 경우의 단서)."""
     if before_points is None or after_points is None or (before_points == 0 and after_points == 0):
@@ -1124,6 +1170,15 @@ async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_u
                 return "expired", "redirected to login (server-side session is no longer valid)"
             if points is None:
                 return "unknown", "point balance unreadable (page did not load as expected)"
+            if points > 0:
+                save_last_balance(cookie_dir, account.user_id, points)  # 이후 적립액 계산의 기준 잔액
+            if emit:
+                try:
+                    body = await page.locator("body").inner_text(timeout=5000)
+                    sample = [x.strip()[:80] for x in body.splitlines() if x.strip()][:45]
+                    emit(f"{account.user_id}: point history sample - {sample}")
+                except Exception:
+                    pass
             return "alive", f"logged in (point balance {points})"
         finally:
             await browser.close()
@@ -2568,12 +2623,10 @@ async def process_account(
                         result.details.extend(details)
                         result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                         result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
-                        if before_points is not None and after_points is not None:
-                            result.estimated_points = max(0, after_points - before_points)
-                            emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
-                        else:
-                            result.estimated_points = 0
+                        result.estimated_points, baseline_ok = _compute_estimated_points(cookie_dir, account.user_id, before_points, after_points, emit)
                         _mark_balance_reliability(result, before_points, after_points, emit)
+                        if not baseline_ok:
+                            result.balance_unreliable = True
                         if any(x.status == "login_error" for x in details):
                             result.session_expired = True
                             note_session_event(account.user_id, expired=True)
@@ -2696,12 +2749,10 @@ async def process_account_manual_link(
                 result.details.extend(details)
                 result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                 result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
-                if before_points is not None and after_points is not None:
-                    result.estimated_points = max(0, after_points - before_points)
-                    emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
-                else:
-                    result.estimated_points = 0
+                result.estimated_points, baseline_ok = _compute_estimated_points(cookie_dir, account.user_id, before_points, after_points, emit)
                 _mark_balance_reliability(result, before_points, after_points, emit)
+                if not baseline_ok:
+                    result.balance_unreliable = True
                 if any(x.status == "login_error" for x in details):
                     result.session_expired = True
                     note_session_event(account.user_id, expired=True)

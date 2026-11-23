@@ -156,6 +156,7 @@ python3 naverpaper.py                # 1회 수집 후 종료 (= run)
 python3 naverpaper.py total          # 적립 합계 + 최근 실행 내역 (-n 30 으로 개수 지정)
 python3 naverpaper.py notify         # 적립 합계를 디스코드로 전송 (수집 없음)
 python3 naverpaper.py notify --test  # 디스코드 테스트 메시지
+python3 naverpaper.py set-points 번호 아이디 적립액 [--yes]  # 잘못 기록된 실행의 적립액 수정 (번호는 total 에서 확인)
 python3 naverpaper.py status         # 계정별 쿠키 파일 상태 (만료일 기준)
 python3 naverpaper.py verify [아이디] # 네이버에 실제 접속해 로그인 상태 확인 (계정당 10~20초)
 python3 naverpaper.py login 아이디    # 수동 로그인 (캡차 대응)
@@ -225,6 +226,30 @@ idA                          7        27        27          37
 idB                          3         3         3           8
 합계                         10        30        30          45
 ```
+
+### 적립액 계산 방식
+
+적립액은 **이번 실행 직후 잔액 − 실행 직전 잔액**입니다. 직전 잔액을 잘못 읽으면 값이 크게 틀어집니다. 예를 들어 잔액이 로딩되기 전의 기본값 `0원`을 직전 잔액으로 읽으면, 지금까지 모은 전체 잔액이 **그 실행 한 번에 적립된 것**으로 기록됩니다. 이를 막기 위해 계정별로 **마지막으로 확인한 잔액**(`data/cookies/<아이디>.balance.json`)을 기준으로 삼습니다.
+
+| 상황 | 처리 |
+| --- | --- |
+| 직전/직후 잔액이 정상 | `직후 − 직전` |
+| 직전 잔액이 `0`, 직후는 양수, 기준 잔액 있음 | 직전 잔액을 `0`으로 잘못 읽은 것으로 보고 **기준 잔액을 직전 잔액으로** 계산 |
+| 직전 잔액이 `0`, 직후는 양수, 기준 잔액 없음 (첫 측정) | **적립액을 세지 않고** 직후 잔액을 기준으로 저장 (로그에 `no baseline yet`, 디스코드에 `[참고]`) |
+| 직전/직후를 못 읽음 | 적립액 0, `[참고]` 표시 |
+| 포인트를 써서 잔액이 줄어듦 | 적립 0 (음수는 세지 않음) |
+| 직후 잔액이 `0` | 로딩 값일 수 있어 기준 잔액으로 저장하지 않음 |
+
+- 잔액이 늘었다는 것만 알 수 있어, 이 도구가 아닌 곳(앱 출석, 직접 클릭 등)의 적립이나 나중에 반영되는 적립은 정확히 구분하지 못합니다. 실제 내역은 네이버페이 포인트 내역이 기준입니다.
+- `verify` 를 실행하면 현재 잔액이 기준 잔액으로 저장됩니다.
+- 이미 잘못 기록된 값은 아래 `set-points` 로 고칠 수 있습니다.
+
+```bash
+./venv/bin/python naverpaper.py total -n 20            # 번호와 계정별 적립 확인
+./venv/bin/python naverpaper.py set-points 7 아이디 0   # 7번 실행의 해당 계정 적립을 0으로 수정
+```
+
+수정 전에 DB를 `naverpaper.sqlite.bak-날짜시각` 으로 백업하고, 그 실행의 합계도 다시 계산합니다. 수집이 실행 중일 때는 거부합니다.
 
 - 적립액은 수집 전후 네이버페이 포인트 **잔액 차이**로 계산한 값입니다. 수집 중 다른 곳에서 포인트를 쓰거나 받으면 오차가 생길 수 있고, 잔액을 읽지 못하면 0으로 기록됩니다.
 - 합계는 `data/naverpaper.sqlite`에 쌓인 기록 기준이라, 기존 플러그인 DB를 복사해 오면 이전 기록까지 합산됩니다.
@@ -300,6 +325,7 @@ idB                          3         3         3           8
     naverpaper.sqlite      수집·방문·적립 기록 DB
     cookies/<아이디>.json   로그인 쿠키
     cookies/<아이디>.relogin  마지막 자동 재로그인 시각 (30분 쿨다운 판단용)
+    cookies/<아이디>.balance.json  마지막으로 확인한 포인트 잔액 (적립액 계산 기준)
     browser_profiles/      로그인용 브라우저 프로필
     naverpaper.log         로그
     run_state.json         실행 중 상태 (정상 종료하면 삭제, 남아 있으면 비정상 종료로 판단)
@@ -434,6 +460,7 @@ journalctl -u naverpaper-mcp -f
 - 새 함수: `is_login_redirect`, `force_relogin`, `repair_expired_session`, `verify_session(_sync)` 와 세션 이벤트 도우미
 - `process_account`, `process_account_manual_link`: 포인트 내역 페이지로 세션을 확인하고, 만료 시 재로그인 후 한 번 재시도. 만료 상태에서는 링크를 처리하지 않고 쿠키를 덮어쓰지 않음
 - `classify_login_failure`, `password_login_on_page`: 로그인 실패 화면에서 원인(captcha 등)을 분류해 `AccountResult.login_error` 로 전달. `ensure_cookie_storage_state` 실패 사유 기록, 수집 단계에서 쿠키가 없으면 먼저 로그인 시도
+- `_compute_estimated_points`, `load/save_last_balance`: 마지막 확인 잔액을 기준으로 적립액을 계산 (직전 잔액 0 오독으로 전체 잔액이 한 번에 적립되는 것 방지). `verify_session` 은 기준 잔액 저장과 포인트 내역 샘플 로그 추가
 - `get_naverpay_point_balance`: 값이 나올 때까지 다시 읽고(0/실패 시 진단 로그), `AccountResult.balance_unreliable` 로 잔액을 못 믿는 경우를 표시
 - `process_campaign_links`: 링크 처리 중 로그인 화면으로 이동하면 중단하고 방문 기록을 저장하지 않음
 - `save_naver_campaign_urls`, `process_naverpay_mission_detail_source`, `process_naverpay_point_main`: 로그인 화면 이동 감지와 재로그인 후 미션 소스 재수집
@@ -448,6 +475,7 @@ journalctl -u naverpaper-mcp -f
 | `session expired; re-login skipped (tried within the last 30 min)` | 30분 이내에 재로그인을 이미 시도해 건너뜀. 수동 로그인하거나 30분 뒤 다음 실행을 기다리세요 |
 | 로그인 로그에 `keep-login control not found` | 개편된 네이버 로그인 화면에서 "로그인 상태 유지"를 못 찾은 경우입니다. 이 버전은 문구 기반으로 다시 찾고, 그래도 못 찾으면 `keep-login candidates: [...]` 줄로 후보 요소의 HTML을 남깁니다. 그 줄을 알려 주시면 정확히 고칠 수 있습니다 |
 | 로그인 성공 로그에 `session-only, no expiry date` | "로그인 상태 유지"가 적용되지 않아 세션 쿠키로 로그인된 것입니다. 동작은 하지만 세션이 일찍 끝날 수 있어, 만료되면 자동 재로그인합니다 |
+| 적립 합계의 7일/30일/전체가 현재 잔액과 같고 오늘은 0 (실제로는 여러 날에 걸쳐 쌓인 잔액) | 직전 잔액을 `0`으로 잘못 읽어 전체 잔액이 한 번의 실행에 적립된 것으로 기록된 경우입니다. 이 버전부터는 기준 잔액으로 막고, 이미 기록된 값은 `total` 로 번호를 확인해 `set-points 번호 아이디 0` 으로 고치세요 |
 | 로그에 `point balance 0 -> 0 (+0)`, 앱에서는 적립 알림이 왔음 | 잔액을 못 읽었거나 로딩 전 기본값 `0원`을 읽은 경우입니다. 이 버전은 값이 나올 때까지 최대 약 15초 다시 읽고, 끝까지 0이거나 못 읽으면 `point balance diagnostic - ... lines near '내 포인트'=[...]` 줄로 화면 내용을 남기며 디스코드 결과에 `[참고]` 줄을 붙입니다. 적립액이 정확하지 않다는 뜻이므로 네이버페이 포인트 내역으로 확인하세요. 진단 로그 줄을 알려 주시면 읽기 방식을 맞춰 고칠 수 있습니다 |
 | `config.json`에 `네이버아이디2` 같은 예시 계정이 남아 있음 | `config.example.json`의 예시 계정입니다. 실제 계정이 아니면 삭제하세요. 가짜 계정으로 로그인을 시도하면 시간 낭비이고 네이버 보안에 걸릴 수 있으며 합계 표에도 0인 줄이 생깁니다 |
 | 계정이 NG 로 나오고 로그인이 안 됨 | `python3 naverpaper.py login 아이디` 로 수동 로그인 |
