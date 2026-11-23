@@ -984,23 +984,91 @@ def _balance_file(cookie_dir: str, user_id: str) -> str:
     return os.path.join(cookie_dir, f"{user_id}.balance.json")
 
 
+def _read_balance_state(cookie_dir: str, user_id: str) -> dict:
+    try:
+        with open(_balance_file(cookie_dir, user_id), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_balance_state(cookie_dir: str, user_id: str, state: dict):
+    try:
+        os.makedirs(cookie_dir, exist_ok=True)
+        state["at"] = datetime.now().isoformat(timespec="seconds")
+        with open(_balance_file(cookie_dir, user_id), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
 def load_last_balance(cookie_dir: str, user_id: str) -> Optional[int]:
     """마지막으로 확인한 포인트 잔액 (없으면 None)."""
     try:
-        with open(_balance_file(cookie_dir, user_id), encoding="utf-8") as f:
-            value = json.load(f).get("balance")
+        value = _read_balance_state(cookie_dir, user_id).get("balance")
         return int(value) if value is not None else None
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return None
 
 
 def save_last_balance(cookie_dir: str, user_id: str, balance: int):
-    try:
-        os.makedirs(cookie_dir, exist_ok=True)
-        with open(_balance_file(cookie_dir, user_id), "w", encoding="utf-8") as f:
-            json.dump({"balance": int(balance), "at": datetime.now().isoformat(timespec="seconds")}, f)
-    except OSError:
-        pass
+    state = _read_balance_state(cookie_dir, user_id)
+    state["balance"] = int(balance)
+    _write_balance_state(cookie_dir, user_id, state)
+
+
+def load_last_event(cookie_dir: str, user_id: str):
+    """마지막으로 확인한 이번 달 이벤트적립 (월, 금액). 없으면 (None, None)."""
+    event = _read_balance_state(cookie_dir, user_id).get("event")
+    if isinstance(event, dict) and event.get("month"):
+        try:
+            return str(event["month"]), int(event.get("amount", 0))
+        except (ValueError, TypeError):
+            pass
+    return None, None
+
+
+def save_event_baseline(cookie_dir: str, user_id: str, month: str, amount: int):
+    """0 은 로딩 값일 수 있어 같은 달에 양수 기록이 있으면 덮어쓰지 않는다 (새 달의 시작은 0 으로 기록)."""
+    if not month:
+        return
+    last_month, last_amount = load_last_event(cookie_dir, user_id)
+    if amount > 0 or last_month != month:
+        state = _read_balance_state(cookie_dir, user_id)
+        state["event"] = {"month": month, "amount": int(amount)}
+        _write_balance_state(cookie_dir, user_id, state)
+
+
+def _compute_earned_points(cookie_dir: str, user_id: str, before: dict, after: dict, emit: Callable[[str], None]):
+    """이번 실행의 적립액을 계산한다. (적립액, 기준 신뢰 여부, 이벤트적립 기준 사용 여부)
+
+    1순위: 이번 달 '이벤트적립' 증가분. 구매적립이나 멤버십적립이 섞이는 잔액 차이보다 이 도구의 클릭 적립에 가깝다.
+    직전 값이 로딩 전 기본값 0 으로 읽히면 전체가 이번 실행의 적립으로 잡히므로, 마지막으로 확인한 값을 기준으로 삼는다.
+    2순위: 이벤트적립을 읽지 못했거나 달이 바뀐 경우 잔액 차이 (_compute_estimated_points)."""
+    b_event, a_event = before.get("event"), after.get("event")
+    month = after.get("month")
+    if b_event is not None and a_event is not None and month and before.get("month") == month:
+        last_month, last_amount = load_last_event(cookie_dir, user_id)
+        baseline, reliable, note = b_event, True, ""
+        if b_event == 0 and a_event > 0:
+            if last_month == month and last_amount and last_amount > 0:
+                baseline = last_amount
+                note = f" [baseline {last_amount} used: event earnings before the run read as 0]"
+            elif last_month is None:
+                baseline, reliable = a_event, False
+                note = " [no baseline yet: event earnings before the run read as 0, so the earned amount is not counted]"
+            # 다른 달의 기록만 있으면 새 달의 첫 적립이므로 0 에서 시작하는 것이 맞다
+        estimated = max(0, a_event - baseline)
+        b_bal, a_bal = before.get("balance"), after.get("balance")
+        change = f"+{max(0, a_bal - b_bal)}" if b_bal is not None and a_bal is not None else "n/a"
+        emit(f"{user_id}: point balance {b_bal} -> {a_bal} (+{estimated}) [event earnings {month} {b_event} -> {a_event}; balance change {change}]{note}")
+        save_event_baseline(cookie_dir, user_id, month, a_event)
+        if a_bal is not None and a_bal > 0:
+            save_last_balance(cookie_dir, user_id, a_bal)
+        return estimated, reliable, True
+    estimated, reliable = _compute_estimated_points(cookie_dir, user_id, before.get("balance"), after.get("balance"), emit)
+    return estimated, reliable, False
 
 
 def _compute_estimated_points(cookie_dir: str, user_id: str, before, after, emit: Callable[[str], None]):
@@ -1165,13 +1233,16 @@ async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_u
             )
             page = await context.new_page()
             await Stealth().apply_stealth_async(page)
-            points = await get_naverpay_point_balance(page, emit, account.user_id)
+            summary = await get_naverpay_point_summary(page, emit, account.user_id)
+            points = summary["balance"]
             if is_login_redirect(page.url):
                 return "expired", "redirected to login (server-side session is no longer valid)"
             if points is None:
                 return "unknown", "point balance unreadable (page did not load as expected)"
             if points > 0:
                 save_last_balance(cookie_dir, account.user_id, points)  # 이후 적립액 계산의 기준 잔액
+            if summary.get("event") is not None and summary.get("month"):
+                save_event_baseline(cookie_dir, account.user_id, summary["month"], summary["event"])
             if emit:
                 try:
                     body = await page.locator("body").inner_text(timeout=5000)
@@ -1179,7 +1250,8 @@ async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_u
                     emit(f"{account.user_id}: point history sample - {sample}")
                 except Exception:
                     pass
-            return "alive", f"logged in (point balance {points})"
+            event_text = f", event earnings {summary['month']}: {summary['event']}" if summary.get("event") is not None else ""
+            return "alive", f"logged in (point balance {points}{event_text})"
         finally:
             await browser.close()
 
@@ -2609,7 +2681,8 @@ async def process_account(
                     result.login_error = login_message
                     result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
                 else:
-                    before_points = await get_naverpay_point_balance(page, emit, account.user_id)
+                    before_summary = await get_naverpay_point_summary(page, emit, account.user_id)
+                    before_points = before_summary["balance"]
                     if is_login_redirect(page.url):
                         # 쿠키 파일은 유효해 보여도 서버에서 세션이 무효화된 상태
                         emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
@@ -2619,12 +2692,14 @@ async def process_account(
                         if before_points is None:
                             emit(f"{account.user_id}: point balance unavailable before run (could not read the balance)")
                         details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
-                        after_points = await get_naverpay_point_balance(page, emit, account.user_id)
+                        after_summary = await get_naverpay_point_summary(page, emit, account.user_id)
+                        after_points = after_summary["balance"]
                         result.details.extend(details)
                         result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                         result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
-                        result.estimated_points, baseline_ok = _compute_estimated_points(cookie_dir, account.user_id, before_points, after_points, emit)
-                        _mark_balance_reliability(result, before_points, after_points, emit)
+                        result.estimated_points, baseline_ok, used_event = _compute_earned_points(cookie_dir, account.user_id, before_summary, after_summary, emit)
+                        if not used_event:
+                            _mark_balance_reliability(result, before_points, after_points, emit)
                         if not baseline_ok:
                             result.balance_unreliable = True
                         if any(x.status == "login_error" for x in details):
@@ -2670,9 +2745,42 @@ def _parse_point_balance(lines):
     return None, -1
 
 
-async def get_naverpay_point_balance(page, emit: Optional[Callable[[str], None]] = None, label: str = "") -> Optional[int]:
-    """네이버페이 포인트 잔액. 로딩 중에는 '0원' 같은 기본값이 보일 수 있어, 0보다 큰 값이 나오거나 시간이 다 될 때까지 다시 읽는다."""
+def _to_amount(text: str) -> int:
+    return int(re.sub(r"[^0-9]", "", str(text)) or "0")
+
+
+def _first_amount_after(lines, idx: int, span: int = 4) -> Optional[int]:
+    for item in lines[idx + 1 : idx + 1 + span]:
+        if re.fullmatch(r"[\d,]+\s*원", item):
+            return _to_amount(item)
+    return None
+
+
+def _parse_point_benefits(lines):
+    """포인트 화면의 '이번 달 적립 혜택' 요약에서 이벤트적립 금액을 읽는다.
+    화면 구성: 기간 줄('2026.11.01. ~ 11.30.'), '총 적립 혜택' 다음 금액, '이벤트적립' 다음 금액('누적 적립 N%' 줄이 사이에 있을 수 있음)."""
+    month = ""
+    for line in lines:
+        found = re.match(r"(\d{4})\.(\d{1,2})\.\d{1,2}\.?\s*~", line)
+        if found:
+            month = f"{found.group(1)}-{int(found.group(2)):02d}"
+            break
+    month_total = event = None
+    for idx, line in enumerate(lines):
+        if month_total is None and line == "총 적립 혜택":
+            month_total = _first_amount_after(lines, idx)
+        if event is None and line == "이벤트적립":
+            event = _first_amount_after(lines, idx)
+    return {"event": event, "month_total": month_total, "month": month}
+
+
+async def get_naverpay_point_summary(page, emit: Optional[Callable[[str], None]] = None, label: str = "", want_event: bool = True) -> dict:
+    """네이버페이 포인트 화면에서 잔액과 이번 달 이벤트적립 금액을 읽는다.
+    반환: {"balance": int|None, "event": int|None, "month_total": int|None, "month": "YYYY-MM"|""}
+    로딩 중에는 '0원' 같은 기본값이 보일 수 있어, 0보다 큰 잔액(그리고 want_event 이면 이벤트적립)이 나올 때까지 다시 읽는다."""
+    summary = {"balance": None, "event": None, "month_total": None, "month": ""}
     value, idx, lines = None, -1, []
+    seen_at = None
     try:
         await page.goto("https://pay.naver.com/pointshistory/list?category=all", wait_until="domcontentloaded", timeout=30000)
         deadline = time.time() + 12
@@ -2681,19 +2789,31 @@ async def get_naverpay_point_balance(page, emit: Optional[Callable[[str], None]]
             body = await page.locator("body").inner_text(timeout=5000)
             lines = [x.strip() for x in body.splitlines() if x.strip()]
             value, idx = _parse_point_balance(lines)
+            summary.update(_parse_point_benefits(lines))
             if value is not None and value > 0:
-                return value
+                if seen_at is None:
+                    seen_at = time.time()
+                # 이벤트적립 요약은 잔액보다 늦게 나타날 수 있어 최대 5초 더 기다린다
+                if not want_event or summary["event"] is not None or time.time() - seen_at >= 5:
+                    summary["balance"] = value
+                    return summary
             if time.time() >= deadline:
                 break
             await page.wait_for_timeout(1500)
     except Exception as e:
         if emit:
             emit(f"{label}: point balance read error - {e}")
-        return None
+        return summary
+    summary["balance"] = value
     if emit:
         sample = lines[idx : idx + 8] if idx >= 0 else lines[:12]
         emit(f"{label}: point balance diagnostic - value={value} lines near '내 포인트'={sample}")
-    return value
+    return summary
+
+
+async def get_naverpay_point_balance(page, emit: Optional[Callable[[str], None]] = None, label: str = "") -> Optional[int]:
+    """잔액만 필요할 때 (이벤트적립 요약을 기다리지 않는다)."""
+    return (await get_naverpay_point_summary(page, emit, label, want_event=False))["balance"]
 
 
 async def process_account_manual_link(
@@ -2738,19 +2858,22 @@ async def process_account_manual_link(
 
         login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
         if login_ok:
-            before_points = await get_naverpay_point_balance(page, emit, account.user_id)
+            before_summary = await get_naverpay_point_summary(page, emit, account.user_id)
+            before_points = before_summary["balance"]
             if is_login_redirect(page.url):
                 emit(f"{account.user_id}: session expired (redirected to login) url={page.url}")
                 note_session_event(account.user_id, expired=True)
                 expired = True
             else:
                 details = await process_campaign_links(page, [link], session_db, account.user_id, emit)
-                after_points = await get_naverpay_point_balance(page, emit, account.user_id)
+                after_summary = await get_naverpay_point_summary(page, emit, account.user_id)
+                after_points = after_summary["balance"]
                 result.details.extend(details)
                 result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
                 result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url", "login_error")])
-                result.estimated_points, baseline_ok = _compute_estimated_points(cookie_dir, account.user_id, before_points, after_points, emit)
-                _mark_balance_reliability(result, before_points, after_points, emit)
+                result.estimated_points, baseline_ok, used_event = _compute_earned_points(cookie_dir, account.user_id, before_summary, after_summary, emit)
+                if not used_event:
+                    _mark_balance_reliability(result, before_points, after_points, emit)
                 if not baseline_ok:
                     result.balance_unreliable = True
                 if any(x.status == "login_error" for x in details):
