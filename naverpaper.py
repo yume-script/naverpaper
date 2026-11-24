@@ -23,11 +23,13 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import sqlite3
 import threading
 import time
 import traceback
+import urllib.parse
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -45,6 +47,15 @@ logger = logging.getLogger("naverpaper")
 
 
 # ---------------------------------------------------------------- 설정
+# 디스코드 웹훅 주소, 또는 앱스 스크립트 게이트웨이 주소 (웹 앱으로 배포한 /exec 주소)
+DISCORD_WEBHOOK_RE = re.compile(r"^https://(?:discord|discordapp)\.com/api/webhooks/")
+GATEWAY_URL_RE = re.compile(r"^https://script\.google\.com/(?:a/macros/[^/?#]+|macros)/s/[\w-]+/exec(?:\?.*)?$")
+
+
+def is_gateway_url(url):
+    return bool(GATEWAY_URL_RE.match(str(url or "")))
+
+
 def _to_bool(value, default=False):
     if isinstance(value, bool):
         return value
@@ -85,8 +96,15 @@ def load_config(path):
         raise ValueError("config.json 의 accounts 가 비어 있습니다")
 
     webhook = str(os.environ.get("NAVERPAPER_DISCORD_WEBHOOK") or cfg.get("discord_webhook_url") or "").strip()
-    if webhook and not webhook.startswith(("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")):
-        raise ValueError("discord_webhook_url 형식이 올바르지 않습니다 (https://discord.com/api/webhooks/... 로 시작해야 함)")
+    if webhook and not (DISCORD_WEBHOOK_RE.match(webhook) or is_gateway_url(webhook)):
+        raise ValueError(
+            "discord_webhook_url 은 디스코드 웹훅 주소(https://discord.com/api/webhooks/...) 또는 "
+            "앱스 스크립트 게이트웨이 주소(https://script.google.com/macros/s/.../exec?parentId=..&threadId=..) 여야 합니다"
+        )
+    gateway_key = str(os.environ.get("NAVERPAPER_DISCORD_GATEWAY_KEY") or cfg.get("discord_gateway_key") or "").strip()
+    if webhook and is_gateway_url(webhook) and gateway_key and not re.search(r"[?&]key=", webhook):
+        # 게이트웨이가 key 를 요구하는 경우: 주소에 key 를 붙여 두면 이후 모든 전송이 그대로 인증된다 (주소는 로그에 남기지 않는다)
+        webhook += ("&" if "?" in webhook else "?") + "key=" + urllib.parse.quote(gateway_key, safe="")
     notify_mode = str(cfg.get("discord_notify_mode") or "always").strip().lower()
     if notify_mode not in ("always", "earned"):
         raise ValueError('discord_notify_mode 는 "always" 또는 "earned" 만 가능합니다')
@@ -353,6 +371,21 @@ def _mask_id(user_id):
     return (user_id[:3] if len(user_id) > 3 else user_id[:1]) + "•••"
 
 
+def _gateway_ok(text):
+    """게이트웨이 응답 본문({"ok": true, ...})을 확인한다. 배포 설정 문제로 로그인 화면(HTML)이 오면 실패로 본다."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        logger.error("게이트웨이 응답이 JSON 이 아닙니다 (배포 액세스가 '모든 사용자'인지, 최신 버전으로 배포했는지 확인): %s", text[:100].replace("\n", " "))
+        return False
+    if isinstance(data, dict) and data.get("ok") is True:
+        return True
+    error = data.get("error") if isinstance(data, dict) else data
+    status = data.get("status") if isinstance(data, dict) else ""
+    logger.error("게이트웨이 전송 실패 %s: %s", status or "", str(error)[:200])
+    return False
+
+
 def _discord_post(webhook_url, body, content_type, retries=2):
     """웹훅 POST 공통 처리 (429 재시도). 성공 True. 토큰이 들어 있으므로 URL 은 로그에 남기지 않는다."""
     import urllib.error
@@ -365,9 +398,15 @@ def _discord_post(webhook_url, body, content_type, retries=2):
             method="POST",
             headers={"Content-Type": content_type, "User-Agent": "naverpaper/1.0"},
         )
+        gateway = is_gateway_url(webhook_url)
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return 200 <= resp.status < 300
+            # 앱스 스크립트는 POST 에 302 로 응답한다 (urllib 이 결과 주소를 GET 으로 따라가 응답 JSON 을 읽는다. 전송은 첫 요청에서 이미 처리됨)
+            with urllib.request.urlopen(req, timeout=40 if gateway else 20) as resp:
+                if not 200 <= resp.status < 300:
+                    return False
+                if gateway:
+                    return _gateway_ok(resp.read().decode("utf-8", "replace"))
+                return True
         except urllib.error.HTTPError as e:
             err = ""
             try:
@@ -400,7 +439,11 @@ def send_discord(webhook_url, payload, retries=2):
 
 
 def send_discord_image(webhook_url, payload, image_bytes, filename="captcha.png", retries=2):
-    """이미지 첨부 전송 (multipart). payload 는 payload_json 으로 함께 보낸다."""
+    """이미지 첨부 전송. 디스코드 웹훅은 multipart, 앱스 스크립트 게이트웨이는 JSON(base64 files)로 보낸다."""
+    if is_gateway_url(webhook_url):
+        body = dict(payload)
+        body["files"] = [{"name": filename, "contentType": "image/png", "base64": base64.b64encode(image_bytes).decode("ascii")}]
+        return _discord_post(webhook_url, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json", retries)
     boundary = "----naverpaper" + uuid.uuid4().hex
     parts = [
         f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'

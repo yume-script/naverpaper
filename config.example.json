@@ -24,6 +24,7 @@
   "proxy_login_enabled": false,
 
   "discord_webhook_url": "",
+  "discord_gateway_key": "",
   "discord_notify_mode": "always",
   "discord_mask_ids": true,
 

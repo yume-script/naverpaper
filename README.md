@@ -139,7 +139,8 @@ pip install -r requirements.txt     # 의존성이 바뀌었을 때만
 | keep_campaign_days / keep_user_days | 오래된 캠페인 URL / 사용자 세션 기록 보관 일수 (기본 60 / 7) |
 | proxy_url | 프록시 주소 |
 | proxy_enabled / proxy_reward_enabled / proxy_login_enabled | 프록시 사용 범위 (전체 / 적립 / 로그인) |
-| discord_webhook_url | 디스코드 웹훅 주소 (아래 참고) |
+| discord_webhook_url | 디스코드 웹훅 주소 **또는 앱스 스크립트 게이트웨이 주소**(`https://script.google.com/macros/s/.../exec?parentId=..&threadId=..`). 아래 "앱스 스크립트 게이트웨이로 보내기" 참고 |
+| discord_gateway_key | 게이트웨이가 요구하는 `key`. 게이트웨이 주소일 때만 사용되며, 주소에 `key=` 가 없으면 자동으로 붙입니다 (환경변수 `NAVERPAPER_DISCORD_GATEWAY_KEY`) |
 | discord_notify_mode | `always` 매번 전송 / `earned` 적립이 있거나 오류일 때만 전송 |
 | discord_mask_ids | true 면 아이디를 앞 3글자만 표시 (`abc•••`) |
 | stall_alert_minutes | 수집 중 새 로그가 이 시간(분) 동안 없으면 "진행 멈춤" 디스코드 알림. 기본 15, 0이면 끔 |
@@ -315,6 +316,32 @@ spamuse: point balance 644 -> 652 (+8) [event earnings 2026-11 88 -> 96; balance
 **보안 주의**: 웹훅 주소에는 토큰이 들어 있어 주소를 아는 사람은 누구나 해당 스레드에 글을 올릴 수 있습니다. `config.json` 권한을 600으로 두고 외부에 공유하지 마세요. 노출됐다면 디스코드에서 웹훅을 재생성하세요.
 
 ---
+
+### 앱스 스크립트 게이트웨이로 보내기
+
+`discord_webhook_url` 에 디스코드 웹훅 대신 **이미 운영 중인 앱스 스크립트 게이트웨이 주소**를 넣어도 됩니다. 이 도구에는 게이트웨이 스크립트가 들어 있지 않으며, 가지고 계신 게이트웨이가 아래 "요청/응답 형식"을 따라야 합니다.
+
+```json
+"discord_webhook_url": "https://script.google.com/macros/s/배포ID/exec?parentId=부모채널ID&threadId=스레드ID",
+"discord_gateway_key": "게이트웨이가 요구하는 key (필요한 경우에만)"
+```
+
+**요청/응답 형식**
+
+| 구분 | 내용 |
+| --- | --- |
+| 요청 | 주소 그대로(쿼리 포함)에 `POST`, `Content-Type: application/json` |
+| 본문 | 디스코드 메시지 JSON: `content` 또는 `embeds` (캡차 이미지일 때는 `attachments` 도 포함) |
+| 캡차 이미지 | 같은 본문에 `"files": [{"name": "captcha.png", "contentType": "image/png", "base64": "..."}]` 를 추가. 임베드는 `"image": {"url": "attachment://captcha.png"}` 로 가리킴 |
+| 인증 키 | `discord_gateway_key`(또는 환경변수 `NAVERPAPER_DISCORD_GATEWAY_KEY`)를 쓰면 주소에 `key=` 가 자동으로 붙음. 주소에 이미 `key=` 가 있으면 그대로 둠 |
+| 응답 | JSON `{"ok": true}` 이면 성공. `ok` 가 아니거나 JSON 이 아니면(구글 로그인 화면 등) 실패로 기록 |
+
+- 앱스 스크립트는 `POST` 에 302 로 응답합니다. 이 도구는 결과 주소를 따라가 응답 JSON 을 읽으며, 전송 자체는 첫 요청에서 이미 처리됩니다.
+- 앱스 스크립트는 오류도 HTTP 200 으로 돌려주므로, 응답이 위 형식과 다르면 **디스코드로는 갔는데 로그에는 실패로 남을 수 있습니다.** 게이트웨이의 응답 형식이 다르면 알려 주세요.
+- 실행 결과, 로그인/약관 경고, 멈춤·비정상 종료·예외 알림, 합계 요약, 테스트 메시지, 캡차 이미지가 모두 같은 방식으로 전달됩니다. MCP 서버도 같은 설정을 씁니다.
+- 처음 한 번은 `python3 naverpaper.py notify --test` 로 연결을 확인하세요.
+- 주소와 키는 비밀번호처럼 다루세요. 로그에는 주소를 남기지 않습니다.
+- 주소는 `https://script.google.com/macros/s/.../exec` 또는 Workspace 형식 `https://script.google.com/a/macros/도메인/s/.../exec` 만 인식합니다. 다른 주소는 거부합니다.
 
 ### 로그인 실패 알림 (원인 포함)
 
@@ -518,6 +545,9 @@ journalctl -u naverpaper-mcp -f
 | `session expired; re-login skipped (tried within the last 30 min)` | 30분 이내에 재로그인을 이미 시도해 건너뜀. 수동 로그인하거나 30분 뒤 다음 실행을 기다리세요 |
 | 로그인 로그에 `keep-login control not found` | 개편된 네이버 로그인 화면에서 "로그인 상태 유지"를 못 찾은 경우입니다. 이 버전은 문구 기반으로 다시 찾고, 그래도 못 찾으면 `keep-login candidates: [...]` 줄로 후보 요소의 HTML을 남깁니다. 그 줄을 알려 주시면 정확히 고칠 수 있습니다 |
 | 로그인 성공 로그에 `session-only, no expiry date` | "로그인 상태 유지"가 적용되지 않아 세션 쿠키로 로그인된 것입니다. 동작은 하지만 세션이 일찍 끝날 수 있어, 만료되면 자동 재로그인합니다 |
+| 로그에 `게이트웨이 응답이 JSON 이 아닙니다` | 앱스 스크립트 배포의 액세스가 "모든 사용자"가 아니거나(구글 로그인 화면이 옴), 주소가 최신 배포가 아닌 경우입니다. 배포 관리에서 액세스 설정을 확인하고 새 버전으로 배포하세요 |
+| 로그에 `게이트웨이 전송 실패 ...: unauthorized` 등 | 게이트웨이가 요구하는 key 와 `discord_gateway_key`(또는 주소의 `key=`)가 다릅니다. 오류 문구는 게이트웨이가 돌려준 내용입니다 |
+| 로그에 `게이트웨이 전송 실패 404: Unknown Webhook` 등 | 게이트웨이가 디스코드로 보내다 실패한 경우입니다(웹훅이 잘못되었거나 삭제됨). 게이트웨이 설정과 디스코드의 웹훅을 확인하세요 |
 | 로그에 `Naver Pay terms agreement page detected`, 포인트 화면 로그에 `네이버페이로 시작하세요`, `약관 모두 동의하기` | 그 계정이 네이버페이 이용약관에 동의하지 않은 상태입니다. 이 상태에서는 적립이 되지 않으므로 링크를 처리하지 않고(방문 기록 없음) 디스코드로 알립니다. 해당 계정으로 `pay.naver.com` 에 접속해 약관에 동의하세요. 이 버전 이전에 처리된 링크가 방문 기록만 남아 있으면 `clear-visits 아이디 --all` 로 지우세요 |
 | 적립 합계의 7일/30일/전체가 현재 잔액과 같고 오늘은 0 (실제로는 여러 날에 걸쳐 쌓인 잔액) | 직전 값을 `0`으로 잘못 읽어 전체 금액이 한 번의 실행에 적립된 것으로 기록된 경우입니다. 이 버전부터는 기준 값으로 막고, 이미 기록된 값은 `total` 로 번호를 확인해 `set-points 번호 아이디 0` 으로 고치세요 |
 | 로그에 `point balance 0 -> 0 (+0)`, 앱에서는 적립 알림이 왔음 | 잔액을 못 읽었거나 로딩 전 기본값 `0원`을 읽은 경우입니다. 이 버전은 값이 나올 때까지 최대 약 15초 다시 읽고, 끝까지 0이거나 못 읽으면 `point balance diagnostic - ... lines near '내 포인트'=[...]` 줄로 화면 내용을 남기며 디스코드 결과에 `[참고]` 줄을 붙입니다. 적립액이 정확하지 않다는 뜻이므로 네이버페이 포인트 내역으로 확인하세요. 진단 로그 줄을 알려 주시면 읽기 방식을 맞춰 고칠 수 있습니다 |
