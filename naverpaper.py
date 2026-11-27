@@ -126,6 +126,8 @@ def load_config(path):
         "discord_notify_mode": notify_mode,
         "discord_mask_ids": _to_bool(cfg.get("discord_mask_ids"), True),
         "mcp_token": str(cfg.get("mcp_token") or "").strip(),
+        "pincrux_click": _to_bool(cfg.get("pincrux_click"), True),
+        "pincrux_wait_seconds": max(0, _to_int(cfg.get("pincrux_wait_seconds"), 5)),
         "stall_alert_minutes": max(0, _to_int(cfg.get("stall_alert_minutes"), 15)),
         "max_run_minutes": max(0, _to_int(cfg.get("max_run_minutes"), 60)),
     }
@@ -202,6 +204,16 @@ class RunLock:
 
 
 # ---------------------------------------------------------------- 쿠키 시드
+def apply_engine_settings(np, cfg):
+    """쇼핑라이브(live-view) 시청 설정을 엔진에 적용한다: 준비 후 마우스 클릭 여부, 클릭 후 대기 시간."""
+    configure = getattr(np, "configure_pincrux", None)
+    if configure is None:
+        return
+    configure(click=cfg.get("pincrux_click", True), wait_seconds=cfg.get("pincrux_wait_seconds", 5))
+    wait = cfg.get("pincrux_wait_seconds", 5)
+    logger.info("쇼핑라이브 설정: 마우스 클릭=%s, 대기=%s", "켬" if cfg.get("pincrux_click", True) else "끔", f"{wait}초(요구 시간이 더 길면 그 시간)" if wait else "요구 시간+3초")
+
+
 def seed_cookies(np, cfg, accounts_cfg):
     """config.json 에 NID_AUT/NID_SES/NID_JST 가 적혀 있고 저장된 쿠키가 유효하지 않으면 쿠키 파일을 만든다."""
     cookie_dir = os.path.join(cfg["data_dir"], "cookies")
@@ -935,6 +947,7 @@ def cmd_run(np, cfg, args):
             logger.exception("이전 실행 상태 확인 실패")
         begin_run_state(cfg, tracker, "cron 실행")
         watchdog.start()
+        apply_engine_settings(np, cfg)
         seed_cookies(np, cfg, cfg["accounts"])
         run_cfg = np.RunConfig(
             db_path=os.path.join(cfg["data_dir"], "naverpaper.sqlite"),
@@ -1235,6 +1248,7 @@ def cmd_link(np, cfg, args):
         logger.warning("이미 수집이 실행 중입니다.")
         return EXIT_LOCKED
     try:
+        apply_engine_settings(np, cfg)
         seed_cookies(np, cfg, cfg["accounts"])
         result = np.run_manual_link_sync(
             os.path.join(cfg["data_dir"], "naverpaper.sqlite"),

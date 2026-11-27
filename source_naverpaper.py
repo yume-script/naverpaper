@@ -4,6 +4,7 @@ import html as html_lib
 import json
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -1693,7 +1694,7 @@ async def click_and_dwell(page, locator, dwell_seconds: float, user_id: str, emi
         return active_page
     ready_wait = await wait_for_dwell_ready(active_page)
     dwell_started_at = time.monotonic()
-    await asyncio.sleep(dwell_seconds)
+    dwell_seconds = await pincrux_dwell(active_page, max(1, int(dwell_seconds) - 3), dwell_seconds, emit, user_id)
     actual_dwell = time.monotonic() - dwell_started_at
     emit_visited(user_id, active_page.url, emit, dwell_seconds=dwell_seconds, actual_dwell=actual_dwell, ready_wait=ready_wait)
     try:
@@ -1701,6 +1702,115 @@ async def click_and_dwell(page, locator, dwell_seconds: float, user_id: str, emi
     except Exception as e:
         emit(f"{user_id}: {label} diagnostic skipped after dwell - {e}")
     return active_page
+
+
+# ---------------------------------------------------------------------------
+# 쇼핑라이브(live-view) 시청 적립: 준비 후 마우스 클릭, 대기 시간
+#
+# 페이지가 '적립 완료' 문구를 보여 줘도 실제 적립이 안 되는 경우가 있어, 사람이 화면을 누른 것처럼 한 번 클릭하고
+# (자동재생 제한 해제, 직접 시청 인식) 요구 시간만큼 기다린다.
+#   PINCRUX_CLICK         True 면 준비가 끝난 뒤 마우스로 한 번 클릭
+#   PINCRUX_WAIT_SECONDS  클릭 후 대기 시간(초). 페이지가 더 긴 시청 시간을 요구하면 그 시간을 따른다.
+#                         0 이하이면 예전 규칙(요구 시간 + 3초)을 쓴다.
+# ---------------------------------------------------------------------------
+PINCRUX_CLICK = True
+PINCRUX_WAIT_SECONDS = 5
+
+
+def configure_pincrux(click=None, wait_seconds=None):
+    global PINCRUX_CLICK, PINCRUX_WAIT_SECONDS
+    if click is not None:
+        PINCRUX_CLICK = bool(click)
+    if wait_seconds is not None:
+        PINCRUX_WAIT_SECONDS = max(0, int(wait_seconds))
+
+
+async def pincrux_mouse_click(page, emit: Callable[[str], None], user_id: str) -> bool:
+    """쇼핑라이브 화면의 플레이어(없으면 화면 위쪽 가운데)를 사람처럼 마우스를 움직인 뒤 한 번 클릭한다.
+    클릭으로 새 탭이 열리거나 다른 주소로 이동하면(광고 등) 되돌린다."""
+    try:
+        context = page.context
+        pages_before = list(context.pages)
+        url_before = str(page.url or "")
+        box, target = None, "viewport"
+        for selector in ("video", "[class*='player' i]", "#player", "[class*='video' i]"):
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0:
+                    continue
+                try:
+                    await locator.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                found = await locator.bounding_box()
+                if found and found["width"] >= 80 and found["height"] >= 60:
+                    box, target = found, selector
+                    break
+            except Exception:
+                continue
+        if box:
+            x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+            y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+        else:
+            size = page.viewport_size or {"width": 390, "height": 844}
+            x = size["width"] * random.uniform(0.4, 0.6)
+            y = size["height"] * random.uniform(0.25, 0.4)
+        await page.mouse.move(max(1, x - random.uniform(30, 80)), max(1, y - random.uniform(20, 60)))
+        await page.mouse.move(x, y, steps=random.randint(6, 12))
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        await page.mouse.click(x, y, delay=random.randint(60, 140))
+        emit(f"{user_id}: pincrux mouse click at ({x:.0f},{y:.0f}) target={target}")
+        await asyncio.sleep(0.5)
+
+        extra_pages = [candidate for candidate in context.pages if candidate not in pages_before]
+        for extra_page in extra_pages:
+            try:
+                await extra_page.close()
+            except Exception:
+                pass
+        if extra_pages:
+            emit(f"{user_id}: pincrux click opened {len(extra_pages)} extra page(s); closed")
+        if str(page.url or "") != url_before and "live-view.html" not in str(page.url or ""):
+            emit(f"{user_id}: pincrux click moved the page to {page.url}; going back")
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        emit(f"{user_id}: pincrux mouse click skipped - {e}")
+        return False
+
+
+async def pincrux_dwell(page, required_seconds, fallback_dwell: float, emit: Callable[[str], None], user_id: str) -> float:
+    """대기한다. live-view 쇼핑라이브면 (설정에 따라) 마우스 클릭 후 PINCRUX_WAIT_SECONDS 만큼, 아니면 fallback_dwell 만큼 기다린다.
+    돌려주는 값은 실제로 계획한 대기 시간(초)이다."""
+    if "live-view.html" not in str(page.url or ""):
+        await asyncio.sleep(fallback_dwell)
+        return fallback_dwell
+    if PINCRUX_CLICK:
+        await pincrux_mouse_click(page, emit, user_id)
+    planned = fallback_dwell if PINCRUX_WAIT_SECONDS <= 0 else float(max(PINCRUX_WAIT_SECONDS, int(required_seconds or 1)))
+    await asyncio.sleep(planned)
+    return planned
+
+
+async def pincrux_completion_text_present(page) -> bool:
+    try:
+        body_text = await page.locator("body").inner_text(timeout=1500)
+    except Exception:
+        return False
+    return "\uc801\ub9bd \uc644\ub8cc" in body_text or "\uc801\ub9bd\uc644\ub8cc" in body_text
+
+
+async def pincrux_confirm_completion(page, completed_before: bool, emit: Callable[[str], None], user_id: str) -> bool:
+    """대기 전에는 없던 '적립 완료' 문구가 대기 후에 나타났을 때만 완료로 본다.
+    카운트다운 화면에 문구가 처음부터 들어 있는 경우를 완료로 오인하지 않기 위함이다."""
+    completed = await wait_for_pincrux_reward_completion(page, timeout_ms=5000)
+    if completed and completed_before:
+        emit(f"{user_id}: pincrux completion text was already on the page before waiting; not counted as a confirmation")
+        return False
+    return completed
 
 
 async def wait_for_dwell_ready(page) -> float:
@@ -1805,11 +1915,11 @@ async def process_live_view_link(page, link: str, user_id: str, emit: Callable[[
     except Exception:
         await campaign_page_diagnostic(page, user_id, "live-view goto timeout/error", emit)
         raise
-    dwell_seconds = max(1, int(seconds or 1)) + 3
     ready_wait = await wait_for_dwell_ready(page)
+    completed_before = await pincrux_completion_text_present(page)
     dwell_started_at = time.monotonic()
-    await asyncio.sleep(dwell_seconds)
-    reward_completed = await wait_for_pincrux_reward_completion(page, timeout_ms=5000)
+    dwell_seconds = await pincrux_dwell(page, seconds, max(1, int(seconds or 1)) + 3, emit, user_id)
+    reward_completed = await pincrux_confirm_completion(page, completed_before, emit, user_id)
     actual_dwell = time.monotonic() - dwell_started_at
     emit_visited(user_id, page.url, emit, dwell_seconds=dwell_seconds, actual_dwell=actual_dwell, ready_wait=ready_wait)
     message = f"live-view watched: {dwell_seconds}s"
@@ -1999,11 +2109,11 @@ async def handle_pincrux_short_live_cards(page, user_id: str, emit: Callable[[st
             if is_excluded_reward_url(active_page.url):
                 emit(f"{user_id}: excluded reward URL - {active_page.url}")
                 continue
-            dwell_seconds = seconds + 3
             ready_wait = await wait_for_dwell_ready(active_page)
+            completed_before = await pincrux_completion_text_present(active_page)
             dwell_started_at = time.monotonic()
-            await asyncio.sleep(dwell_seconds)
-            reward_completed = await wait_for_pincrux_reward_completion(active_page, timeout_ms=5000)
+            dwell_seconds = await pincrux_dwell(active_page, seconds, seconds + 3, emit, user_id)
+            reward_completed = await pincrux_confirm_completion(active_page, completed_before, emit, user_id)
             actual_dwell = time.monotonic() - dwell_started_at
             emit_visited(user_id, active_page.url, emit, dwell_seconds=dwell_seconds, actual_dwell=actual_dwell, ready_wait=ready_wait)
             if reward_completed:
@@ -2420,10 +2530,10 @@ async def handle_naverpay_mission_detail(page, link: str, session_db, user_id: s
                 if detail.status not in ("skipped", "unavailable", "no_url", "error"):
                     visited += 1
             else:
-                dwell_seconds = row_seconds + 3 if "live-view.html" in active_page.url else 4
+                fallback_dwell = row_seconds + 3 if "live-view.html" in active_page.url else 4
                 ready_wait = await wait_for_dwell_ready(active_page)
                 dwell_started_at = time.monotonic()
-                await asyncio.sleep(dwell_seconds)
+                dwell_seconds = await pincrux_dwell(active_page, row_seconds, fallback_dwell, emit, user_id)
                 actual_dwell = time.monotonic() - dwell_started_at
                 emit_visited(user_id, active_page.url, emit, dwell_seconds=dwell_seconds, actual_dwell=actual_dwell, ready_wait=ready_wait)
                 visited += 1

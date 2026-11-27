@@ -143,6 +143,8 @@ pip install -r requirements.txt     # 의존성이 바뀌었을 때만
 | discord_gateway_key | 게이트웨이가 요구하는 `key`. 게이트웨이 주소일 때만 사용되며, 주소에 `key=` 가 없으면 자동으로 붙입니다 (환경변수 `NAVERPAPER_DISCORD_GATEWAY_KEY`) |
 | discord_notify_mode | `always` 매번 전송 / `earned` 적립이 있거나 오류일 때만 전송 |
 | discord_mask_ids | true 면 아이디를 앞 3글자만 표시 (`abc•••`) |
+| pincrux_click | 쇼핑라이브(`live-view`)에서 페이지 준비 후 **마우스로 한 번 클릭**할지 (기본 true) |
+| pincrux_wait_seconds | 클릭 후 대기 시간(초). 기본 5. 페이지가 더 긴 시청 시간을 요구하면 그 시간을 따름. 0이면 예전 규칙(요구 시간 + 3초) |
 | stall_alert_minutes | 수집 중 새 로그가 이 시간(분) 동안 없으면 "진행 멈춤" 디스코드 알림. 기본 15, 0이면 끔 |
 | max_run_minutes | 한 번의 실행이 이 시간(분)을 넘기면 "시간 초과" 알림. 기본 60, 0이면 끔 |
 | mcp_token | MCP 서버(`naverpaper_mcp.py`) 인증 토큰. 외부 주소에 바인딩하면 필수 (7장 참고) |
@@ -343,6 +345,27 @@ spamuse: point balance 644 -> 652 (+8) [event earnings 2026-11 88 -> 96; balance
 - 주소와 키는 비밀번호처럼 다루세요. 로그에는 주소를 남기지 않습니다.
 - 주소는 `https://script.google.com/macros/s/.../exec` 또는 Workspace 형식 `https://script.google.com/a/macros/도메인/s/.../exec` 만 인식합니다. 다른 주소는 거부합니다.
 
+### 쇼핑라이브 시청 적립: 마우스 클릭과 대기
+
+`... pincrux reward completed` 가 찍혀도 실제 적립이 안 되는 경우를 위해, 쇼핑라이브(`nsl.pincrux.com/live-view.html`) 처리 방식을 바꿨습니다.
+
+1. 페이지가 준비되면(`ready_wait`) **마우스로 한 번 클릭**합니다. 플레이어가 있으면 그 안쪽을, 없으면 화면 위쪽 가운데를 사람처럼 마우스를 움직인 뒤 누릅니다.
+2. 클릭 후 **5초 대기**합니다(`pincrux_wait_seconds`). 페이지가 "N초 이상 시청"을 요구하면 그 시간(N초)이 더 길 때 N초를 기다립니다. 예전에는 요구 시간 + 3초(보통 8초)였습니다.
+3. 클릭으로 새 탭이 열리거나 다른 주소로 이동하면(광고 등) 새 탭은 닫고 원래 화면으로 되돌립니다. 클릭이 실패해도 수집은 계속됩니다.
+
+로그에서는 이렇게 보입니다.
+```
+spamuse: pincrux mouse click at (195,310) target=video
+spamuse: visited https://nsl.pincrux.com/live-view.html?bno=... dwell=5.1s planned=5.0s ready_wait=10.3s
+spamuse: pincrux reward completed - https://nsl.pincrux.com/live-view.html?bno=...
+```
+- `target=video` 는 플레이어를 눌렀다는 뜻이고, `target=viewport` 는 플레이어를 찾지 못해 화면 위쪽 가운데를 눌렀다는 뜻입니다.
+- 시작할 때 `쇼핑라이브 설정: 마우스 클릭=켬, 대기=5초` 줄이 찍힙니다. 설정이 적용됐는지 여기서 확인하세요.
+- 끄려면 `"pincrux_click": false`, 예전 대기 시간으로 되돌리려면 `"pincrux_wait_seconds": 0` 으로 설정합니다.
+- 쇼핑라이브가 아닌 링크(`campaign2` 등)의 대기 방식은 그대로입니다.
+
+**완료 판정도 바꿨습니다.** 예전에는 페이지 글자에 "적립 완료"가 있는지만 보아서, 카운트다운 화면에 이 문구가 처음부터 들어 있으면 대기 직후 바로 `reward completed` 가 찍혔습니다. 지금은 **대기 전에는 없던 문구가 대기 후에 생겼을 때만** 완료로 봅니다. 대기 전부터 있었다면 `pincrux completion text was already on the page before waiting; not counted as a confirmation` 이 찍히고 `reward completed` 는 나오지 않습니다. 이 줄은 로그의 표시일 뿐이며 적립 자체에는 영향을 주지 않습니다. 실제 적립은 수집이 끝날 때의 `event earnings ... (+N)` 줄로 확인하세요.
+
 ### 로그인 실패 알림 (원인 포함)
 
 수집 중 네이버 로그인에 실패하거나 세션이 만료되어 처리하지 못한 계정이 있으면 디스코드로 빨간색 경고가 갑니다. 경고에는 **원인과 조치**가 함께 들어 있습니다. (`discord_notify_mode`가 `earned`여도 항상 전송됩니다.)
@@ -530,6 +553,7 @@ journalctl -u naverpaper-mcp -f
 - `classify_login_failure`, `password_login_on_page`: 로그인 실패 화면에서 원인(captcha 등)을 분류해 `AccountResult.login_error` 로 전달. `ensure_cookie_storage_state` 실패 사유 기록, 수집 단계에서 쿠키가 없으면 먼저 로그인 시도
 - `_is_pay_terms_page`, `process_account(_manual_link)`: 네이버페이 약관 미동의 계정은 링크를 처리하지 않고 `AccountResult.pay_terms_required` 로 표시
 - `_evaluate_run_points`, `_balance_trusted`, `RunAccountSummary.used_points/balance_after`: 잔액 감소로 사용 금액을 추정해 저장 (예전 DB 는 열을 자동 추가)
+- `pincrux_mouse_click`, `pincrux_dwell`, `pincrux_confirm_completion`, `configure_pincrux`: 쇼핑라이브(live-view) 처리 4곳(`process_live_view_link`, `handle_pincrux_short_live_cards`, 행 기반 처리, `click_and_dwell`)에 클릭 + 대기 규칙 적용, 완료 판정 보정
 - `get_naverpay_point_summary`, `_parse_point_benefits`, `_compute_earned_points`: 포인트 화면의 이번 달 **이벤트적립** 증가분으로 적립액을 계산하고, 마지막 확인 값을 기준으로 직전 값 0 오독을 막음. 이벤트적립을 못 읽으면 `_compute_estimated_points`(잔액 차이)로 폴백. `verify_session` 은 기준 값 저장과 포인트 화면 샘플 로그 추가
 - `get_naverpay_point_balance`: 값이 나올 때까지 다시 읽고(0/실패 시 진단 로그), `AccountResult.balance_unreliable` 로 잔액을 못 믿는 경우를 표시
 - `process_campaign_links`: 링크 처리 중 로그인 화면으로 이동하면 중단하고 방문 기록을 저장하지 않음

@@ -30,6 +30,9 @@
 
   "mcp_token": "",
 
+  "pincrux_click": true,
+  "pincrux_wait_seconds": 5,
+
   "stall_alert_minutes": 15,
   "max_run_minutes": 60,
 

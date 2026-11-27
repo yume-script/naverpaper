@@ -232,6 +232,7 @@ def _do_run():
         return {"status": "skipped", "message": "다른 수집 또는 로그인이 이미 진행 중이라 건너뜁니다."}
     tracker, watchdog = _begin_guard(cfg, "MCP 수집 실행")
     try:
+        nv.apply_engine_settings(np, cfg)
         nv.seed_cookies(np, cfg, cfg["accounts"])
         run_cfg = np.RunConfig(
             db_path=p["db"],
@@ -272,6 +273,7 @@ def _do_link(url):
         return {"status": "skipped", "message": "다른 수집 또는 로그인이 이미 진행 중이라 건너뜁니다."}
     tracker, watchdog = _begin_guard(cfg, "MCP 링크 적립")
     try:
+        nv.apply_engine_settings(np, cfg)
         nv.seed_cookies(np, cfg, cfg["accounts"])
         try:
             result = np.run_manual_link_sync(
