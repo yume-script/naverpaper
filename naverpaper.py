@@ -11,6 +11,7 @@
   python3 naverpaper.py notify          # 적립 합계를 디스코드로 전송 (--test: 테스트 메시지)
   python3 naverpaper.py set-points 번호 아이디 적립액 [--yes]  # 잘못 기록된 실행의 적립액 수정
   python3 naverpaper.py clear-visits 아이디 [--all] [--yes]  # 방문 기록 삭제(링크 재시도)
+  python3 naverpaper.py pincrux-test URL [--desktop]  # 쇼핑라이브 링크 하나로 브라우저 환경/영상 재생 진단
   python3 naverpaper.py status          # 계정별 쿠키 파일 상태 확인(만료일 기준)
   python3 naverpaper.py verify [아이디]  # 네이버에 실제 접속해 로그인 상태 확인
   python3 naverpaper.py login <아이디>   # 캡차 등으로 자동 로그인이 막힐 때 수동 로그인
@@ -62,6 +63,15 @@ def _to_bool(value, default=False):
     if value is None or value == "":
         return default
     return str(value).strip().lower() in ("true", "1", "on", "yes")
+
+
+def _to_args(value):
+    """브라우저 추가 인자: 리스트 또는 공백으로 구분한 문자열."""
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return value.split()
+    return []
 
 
 def _to_int(value, default):
@@ -126,6 +136,10 @@ def load_config(path):
         "discord_notify_mode": notify_mode,
         "discord_mask_ids": _to_bool(cfg.get("discord_mask_ids"), True),
         "mcp_token": str(cfg.get("mcp_token") or "").strip(),
+        "browser_channel": str(cfg.get("browser_channel") or "").strip(),
+        "browser_headless": _to_bool(cfg.get("browser_headless"), True),
+        "browser_args": _to_args(cfg.get("browser_args")),
+        "pincrux_diagnostic": _to_bool(cfg.get("pincrux_diagnostic"), True),
         "pincrux_click": _to_bool(cfg.get("pincrux_click"), True),
         "pincrux_wait_seconds": max(0, _to_int(cfg.get("pincrux_wait_seconds"), 5)),
         "stall_alert_minutes": max(0, _to_int(cfg.get("stall_alert_minutes"), 15)),
@@ -205,11 +219,20 @@ class RunLock:
 
 # ---------------------------------------------------------------- 쿠키 시드
 def apply_engine_settings(np, cfg):
-    """쇼핑라이브(live-view) 시청 설정을 엔진에 적용한다: 준비 후 마우스 클릭 여부, 클릭 후 대기 시간."""
+    """엔진 설정 적용: 브라우저 종류/화면 유무/추가 인자, 쇼핑라이브(live-view) 클릭·대기·진단."""
+    configure_browser = getattr(np, "configure_browser", None)
+    if configure_browser is not None:
+        configure_browser(channel=cfg.get("browser_channel", ""), headless=cfg.get("browser_headless", True), args=cfg.get("browser_args", []))
+        logger.info(
+            "브라우저 설정: 종류=%s, 화면=%s%s",
+            cfg.get("browser_channel") or "Playwright 내장 Chromium",
+            "없음(headless)" if cfg.get("browser_headless", True) else "있음(xvfb-run 필요)",
+            f", 추가 인자={cfg['browser_args']}" if cfg.get("browser_args") else "",
+        )
     configure = getattr(np, "configure_pincrux", None)
     if configure is None:
         return
-    configure(click=cfg.get("pincrux_click", True), wait_seconds=cfg.get("pincrux_wait_seconds", 5))
+    configure(click=cfg.get("pincrux_click", True), wait_seconds=cfg.get("pincrux_wait_seconds", 5), diagnostic=cfg.get("pincrux_diagnostic", True))
     wait = cfg.get("pincrux_wait_seconds", 5)
     logger.info("쇼핑라이브 설정: 마우스 클릭=%s, 대기=%s", "켬" if cfg.get("pincrux_click", True) else "끔", f"{wait}초(요구 시간이 더 길면 그 시간)" if wait else "요구 시간+3초")
 
@@ -1158,6 +1181,58 @@ def cmd_clear_visits(np, cfg, args):
         lock.release()
 
 
+def format_probe(report, hints):
+    env = report.get("env_after") or {}
+    video = env.get("video") or {}
+    lines = [
+        f"브라우저: {report.get('channel')} / 화면 {'없음(headless)' if report.get('headless') else '있음'} / {'데스크톱' if report.get('mode') == 'desktop' else '모바일'} 모드",
+        f"이동한 곳: {report.get('final_host')}   준비 대기 {report.get('ready_wait')}초, 계획 {report.get('planned')}초, 실제 {report.get('actual')}초",
+        f"UA: {str(env.get('ua') or '')[:110]}",
+        f"자동화 흔적: webdriver={env.get('webdriver')} window.chrome={env.get('chromeObj')} plugins={env.get('plugins')}",
+        f"코덱: H.264={env.get('h264')} HLS={env.get('hls')}",
+        f"창 상태: {env.get('visibility')} / 포커스 {env.get('focus')}",
+        (
+            f"영상: {env.get('videos')}개, paused={video.get('paused')} 재생시간={video.get('t')}초 readyState={video.get('ready')} 오류={video.get('err')} 출처={video.get('srcHost')}"
+            if video
+            else f"영상: {env.get('videos', 0)}개 (video 요소 없음)"
+        ),
+        f"완료 문구: 대기 전 {'있음' if report.get('completion_text_before') else '없음'} → 확인 {'됨' if report.get('completion_confirmed') else '안 됨'}",
+        "",
+        "진단:",
+    ]
+    lines += [f"  - {h}" for h in hints]
+    return lines
+
+
+def cmd_pincrux_test(np, cfg, args):
+    """쇼핑라이브 링크 하나를 현재 브라우저 설정으로 열어 보고, 스크립트와 실제 크롬의 차이를 진단한다 (방문 기록 없음)."""
+    url = str(args.url or "").strip()
+    if not url.startswith("https://nsl.pincrux.com/"):
+        logger.error("쇼핑라이브 주소(https://nsl.pincrux.com/live-view.html?...)만 시험할 수 있습니다")
+        return EXIT_CONFIG
+    accounts = [a for a in cfg["accounts"] if not args.account or a["user_id"] == args.account]
+    if not accounts:
+        logger.error("config.json 에 없는 계정입니다: %s", args.account)
+        return EXIT_CONFIG
+    acc = accounts[0]
+    lock = RunLock(os.path.join(cfg["data_dir"], "naverpaper.lock"))
+    if not lock.acquire():
+        logger.error("수집이 실행 중입니다. 끝난 뒤 다시 실행하세요.")
+        return EXIT_LOCKED
+    try:
+        apply_engine_settings(np, cfg)
+        account = np.AccountConfig(user_id=acc["user_id"], password=acc["password"], keep_login=acc["keep_login"])
+        report = np.pincrux_probe_sync(account, os.path.join(cfg["data_dir"], "cookies"), url, cfg["reward_proxy_url"], desktop=args.desktop, log=lambda m: logger.info("%s", m))
+    finally:
+        lock.release()
+    if report.get("error"):
+        print(f"시험 실패: {report['error']}")
+        return EXIT_ERROR
+    for line in format_probe(report, np.interpret_probe(report.get("env_after") or {})):
+        print(line)
+    return EXIT_OK
+
+
 def cmd_status(np, cfg, args):
     cookie_dir = os.path.join(cfg["data_dir"], "cookies")
     for acc in cfg["accounts"]:
@@ -1291,6 +1366,10 @@ def main():
     p_clear.add_argument("user_id")
     p_clear.add_argument("--all", action="store_true", help="오늘뿐 아니라 전체 기록 삭제")
     p_clear.add_argument("--yes", action="store_true", help="확인 질문 없이 진행")
+    p_pt = sub.add_parser("pincrux-test", help="쇼핑라이브 링크 하나를 열어 브라우저 환경/영상 재생을 진단 (방문 기록 없음)")
+    p_pt.add_argument("url")
+    p_pt.add_argument("--desktop", action="store_true", help="모바일 대신 데스크톱 모드로 열기")
+    p_pt.add_argument("--account", default="", help="사용할 계정 아이디 (기본: 첫 번째 계정)")
     p_verify = sub.add_parser("verify", help="네이버에 실제 접속해 로그인 상태 확인")
     p_verify.add_argument("user_id", nargs="?", default="")
     p_login = sub.add_parser("login", help="수동 로그인(캡차 대응)")
@@ -1315,7 +1394,7 @@ def main():
         logger.error("pip install -r requirements.txt && playwright install chromium")
         return EXIT_CONFIG
 
-    handlers = {"run": cmd_run, "clear-visits": cmd_clear_visits, "set-points": cmd_set_points, "verify": cmd_verify, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
+    handlers = {"run": cmd_run, "pincrux-test": cmd_pincrux_test, "clear-visits": cmd_clear_visits, "set-points": cmd_set_points, "verify": cmd_verify, "total": cmd_total, "notify": cmd_notify, "status": cmd_status, "login": cmd_login, "link": cmd_link}
     try:
         return handlers[command](np, cfg, args)
     except KeyboardInterrupt:

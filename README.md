@@ -143,6 +143,10 @@ pip install -r requirements.txt     # 의존성이 바뀌었을 때만
 | discord_gateway_key | 게이트웨이가 요구하는 `key`. 게이트웨이 주소일 때만 사용되며, 주소에 `key=` 가 없으면 자동으로 붙입니다 (환경변수 `NAVERPAPER_DISCORD_GATEWAY_KEY`) |
 | discord_notify_mode | `always` 매번 전송 / `earned` 적립이 있거나 오류일 때만 전송 |
 | discord_mask_ids | true 면 아이디를 앞 3글자만 표시 (`abc•••`) |
+| browser_channel | 사용할 브라우저. 비우면 Playwright 내장 Chromium, `"chrome"` 이면 설치된 **실제 Google Chrome**, `"msedge"` 도 가능 |
+| browser_headless | `true`(기본)면 화면 없이 실행, `false`면 화면이 있는 모드 (서버에서는 `xvfb-run` 필요) |
+| browser_args | 브라우저 추가 실행 인자 (리스트 또는 공백으로 구분한 문자열) |
+| pincrux_diagnostic | 쇼핑라이브 대기 후 브라우저 환경/영상 재생 상태를 로그에 한 줄 남김 (기본 true) |
 | pincrux_click | 쇼핑라이브(`live-view`)에서 페이지 준비 후 **마우스로 한 번 클릭**할지 (기본 true) |
 | pincrux_wait_seconds | 클릭 후 대기 시간(초). 기본 5. 페이지가 더 긴 시청 시간을 요구하면 그 시간을 따름. 0이면 예전 규칙(요구 시간 + 3초) |
 | stall_alert_minutes | 수집 중 새 로그가 이 시간(분) 동안 없으면 "진행 멈춤" 디스코드 알림. 기본 15, 0이면 끔 |
@@ -366,6 +370,58 @@ spamuse: pincrux reward completed - https://nsl.pincrux.com/live-view.html?bno=.
 
 **완료 판정도 바꿨습니다.** 예전에는 페이지 글자에 "적립 완료"가 있는지만 보아서, 카운트다운 화면에 이 문구가 처음부터 들어 있으면 대기 직후 바로 `reward completed` 가 찍혔습니다. 지금은 **대기 전에는 없던 문구가 대기 후에 생겼을 때만** 완료로 봅니다. 대기 전부터 있었다면 `pincrux completion text was already on the page before waiting; not counted as a confirmation` 이 찍히고 `reward completed` 는 나오지 않습니다. 이 줄은 로그의 표시일 뿐이며 적립 자체에는 영향을 주지 않습니다. 실제 적립은 수집이 끝날 때의 `event earnings ... (+N)` 줄로 확인하세요.
 
+### 쇼핑라이브가 실제 크롬에서는 되는데 스크립트로는 안 될 때
+
+스크립트가 쓰는 Playwright 내장 Chromium은 실제 Google Chrome과 다른 점이 있습니다. 쇼핑라이브(`live-view`)가 적립을 인정하는 조건은 알 수 없으므로, **무엇이 다른지 먼저 확인**하고 차이를 줄이는 순서로 진행하세요.
+
+**1단계. 진단하기**: 로그에서 쇼핑라이브 주소를 하나 복사해(가장 최근 것을 쓰세요) 시험 실행합니다. 방문 기록은 남기지 않습니다. 다만 실제로 링크를 여는 것이라 적립될 수도 있습니다.
+
+```bash
+./venv/bin/python naverpaper.py pincrux-test "https://nsl.pincrux.com/live-view.html?bno=...&enc_param=..."
+./venv/bin/python naverpaper.py pincrux-test "<같은 주소>" --desktop     # 모바일 대신 데스크톱 모드로 비교
+```
+
+출력의 `진단:` 항목이 의심되는 차이를 알려 줍니다. 수집 중에도 같은 정보가 `pincrux env {...}` 로그 한 줄로 남습니다.
+
+| 진단 문구 | 의미와 조치 |
+| --- | --- |
+| `H.264 영상을 재생하지 못합니다`, `영상 재생 오류 ... 코드 4` | 내장 Chromium에는 상용 코덱이 없어 영상이 재생되지 않을 수 있습니다. **실제 Chrome을 사용**하세요 (2단계) |
+| `HeadlessChrome 으로 식별됩니다`, `webdriver 가 true`, `window.chrome 객체가 없습니다` | 자동화 브라우저로 판단될 수 있는 흔적입니다. 실제 Chrome 사용, 필요하면 화면 모드(3단계) |
+| `페이지 상태가 hidden`, `포커스가 없습니다` | 보이지 않는 탭으로 취급되면 시청 시간이 인정되지 않을 수 있습니다. 화면 모드(3단계) |
+| `영상이 일시정지 상태입니다`, `재생 시간이 0` | 자동재생이 막혔거나 재생이 시작되지 않았습니다. 클릭 설정과 브라우저 종류를 확인하세요 |
+| `<video> 요소를 찾지 못했습니다` | 영상이 다른 방식으로 재생되거나 로딩 전입니다. `--desktop` 으로 비교해 보세요 |
+
+**2단계. 실제 Google Chrome 사용**
+
+```bash
+sudo ./venv/bin/playwright install chrome      # 또는 Chrome 안정 버전 deb 를 직접 설치
+```
+```json
+"browser_channel": "chrome"
+```
+설정을 바꾼 뒤 `pincrux-test` 로 진단이 바뀌었는지 다시 확인하세요. 시작할 때 `브라우저 설정: 종류=chrome, 화면=없음(headless)` 줄이 찍힙니다.
+
+**3단계. 화면이 있는 모드** (필요할 때만): 서버에는 화면이 없으므로 가상 화면(xvfb)이 필요합니다.
+
+```bash
+sudo apt install -y xvfb
+```
+```json
+"browser_channel": "chrome",
+"browser_headless": false
+```
+cron 과 MCP 서비스는 `xvfb-run` 으로 감싸서 실행합니다.
+```cron
+0 3,9,15,21 * * * cd /mnt/naverpaper && xvfb-run -a ./venv/bin/python naverpaper.py
+```
+```ini
+ExecStart=/usr/bin/xvfb-run -a /mnt/naverpaper/venv/bin/python /mnt/naverpaper/naverpaper_mcp.py --host 0.0.0.0 --port 5934
+```
+화면 모드인데 `xvfb-run` 없이 실행하면 `Missing X server or $DISPLAY` 오류가 납니다.
+
+- 화면 모드와 실제 Chrome은 메모리를 더 씁니다. 계정을 순서대로 처리하므로 동시에 여러 개가 뜨지는 않지만, 서버가 무거우면 수집이 느려질 수 있습니다.
+- 위 설정은 **모든 브라우저 실행**(수집, 로그인, 시험)에 적용됩니다. 로그인이나 다른 링크 처리가 달라졌다면 `browser_channel` 을 비워 되돌려 보세요.
+
 ### 로그인 실패 알림 (원인 포함)
 
 수집 중 네이버 로그인에 실패하거나 세션이 만료되어 처리하지 못한 계정이 있으면 디스코드로 빨간색 경고가 갑니다. 경고에는 **원인과 조치**가 함께 들어 있습니다. (`discord_notify_mode`가 `earned`여도 항상 전송됩니다.)
@@ -553,6 +609,7 @@ journalctl -u naverpaper-mcp -f
 - `classify_login_failure`, `password_login_on_page`: 로그인 실패 화면에서 원인(captcha 등)을 분류해 `AccountResult.login_error` 로 전달. `ensure_cookie_storage_state` 실패 사유 기록, 수집 단계에서 쿠키가 없으면 먼저 로그인 시도
 - `_is_pay_terms_page`, `process_account(_manual_link)`: 네이버페이 약관 미동의 계정은 링크를 처리하지 않고 `AccountResult.pay_terms_required` 로 표시
 - `_evaluate_run_points`, `_balance_trusted`, `RunAccountSummary.used_points/balance_after`: 잔액 감소로 사용 금액을 추정해 저장 (예전 DB 는 열을 자동 추가)
+- `browser_launch_kwargs`, `configure_browser`: 모든 브라우저 실행(11곳)이 공통 옵션(종류, 화면 유무, 추가 인자)을 거침. `pincrux_env_report`, `interpret_probe`, `pincrux_probe`: 쇼핑라이브 환경 진단과 시험 실행
 - `pincrux_mouse_click`, `pincrux_dwell`, `pincrux_confirm_completion`, `configure_pincrux`: 쇼핑라이브(live-view) 처리 4곳(`process_live_view_link`, `handle_pincrux_short_live_cards`, 행 기반 처리, `click_and_dwell`)에 클릭 + 대기 규칙 적용, 완료 판정 보정
 - `get_naverpay_point_summary`, `_parse_point_benefits`, `_compute_earned_points`: 포인트 화면의 이번 달 **이벤트적립** 증가분으로 적립액을 계산하고, 마지막 확인 값을 기준으로 직전 값 0 오독을 막음. 이벤트적립을 못 읽으면 `_compute_estimated_points`(잔액 차이)로 폴백. `verify_session` 은 기준 값 저장과 포인트 화면 샘플 로그 추가
 - `get_naverpay_point_balance`: 값이 나올 때까지 다시 읽고(0/실패 시 진단 로그), `AccountResult.balance_unreliable` 로 잔액을 못 믿는 경우를 표시

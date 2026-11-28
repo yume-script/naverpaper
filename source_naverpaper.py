@@ -830,7 +830,7 @@ async def refresh_cookie(account: AccountConfig, cookie_dir: str, proxy_url: str
         proxy = playwright_proxy(proxy_url)
         if proxy:
             launch_kwargs["proxy"] = proxy
-        browser = await playwright.chromium.launch(**launch_kwargs)
+        browser = await playwright.chromium.launch(**browser_launch_kwargs(launch_kwargs))
         context = await browser.new_context(
             user_agent=IPHONE13_UA,
             viewport={"width": 390, "height": 844},
@@ -889,7 +889,7 @@ async def refresh_cookie_from_profile(
         if proxy:
             launch_kwargs["proxy"] = proxy
         log(f"{account.user_id}: cookie auto refresh opening persistent browser")
-        context = await playwright.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
+        context = await playwright.chromium.launch_persistent_context(profile_dir, **browser_launch_kwargs(launch_kwargs))
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             await Stealth().apply_stealth_async(page)
@@ -1200,7 +1200,7 @@ async def force_relogin(account: AccountConfig, session_db, cookie_dir: str, pro
         proxy = playwright_proxy(proxy_url)
         if proxy:
             launch_kwargs["proxy"] = proxy
-        context = await playwright.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
+        context = await playwright.chromium.launch_persistent_context(profile_dir, **browser_launch_kwargs(launch_kwargs))
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             await Stealth().apply_stealth_async(page)
@@ -1251,6 +1251,64 @@ async def repair_expired_session(account: AccountConfig, session_db, cookie_dir:
     return ok
 
 
+async def pincrux_probe(account: AccountConfig, cookie_dir: str, url: str, reward_proxy_url: str = "", desktop: bool = False, emit: Optional[Callable[[str], None]] = None) -> dict:
+    """쇼핑라이브 링크 하나를 현재 브라우저 설정으로 열어 클릭/대기/진단을 수행한다. DB 에는 아무것도 기록하지 않는다."""
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+
+    log = emit or (lambda message: None)
+    ok, message = check_cookie_status(account.user_id, cookie_dir)
+    if not ok:
+        return {"error": f"cookie file: {message}"}
+    async with async_playwright() as playwright:
+        launch_kwargs = {"headless": True}
+        proxy = playwright_proxy(reward_proxy_url)
+        if proxy:
+            launch_kwargs["proxy"] = proxy
+        browser = await playwright.chromium.launch(**browser_launch_kwargs(launch_kwargs))
+        try:
+            if desktop:
+                context = await browser.new_context(user_agent=DESKTOP_UA, viewport={"width": 1280, "height": 800}, storage_state=cookie_path(cookie_dir, account.user_id))
+            else:
+                context = await browser.new_context(
+                    user_agent=IPHONE13_UA,
+                    viewport={"width": 390, "height": 844},
+                    device_scale_factor=3,
+                    is_mobile=True,
+                    has_touch=True,
+                    storage_state=cookie_path(cookie_dir, account.user_id),
+                )
+            page = await context.new_page()
+            await Stealth().apply_stealth_async(page)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            ready_wait = await wait_for_dwell_ready(page)
+            completed_before = await pincrux_completion_text_present(page)
+            env_before = await pincrux_env_report(page)
+            started = time.monotonic()
+            planned = await pincrux_dwell(page, 5, 8, log, "probe")
+            env_after = await pincrux_env_report(page)
+            completed = await pincrux_confirm_completion(page, completed_before, log, "probe")
+            return {
+                "final_host": urlparse(str(page.url)).netloc,
+                "ready_wait": round(ready_wait, 1),
+                "planned": planned,
+                "actual": round(time.monotonic() - started, 1),
+                "completion_text_before": completed_before,
+                "completion_confirmed": completed,
+                "env_before": env_before,
+                "env_after": env_after,
+                "mode": "desktop" if desktop else "mobile",
+                "channel": BROWSER_CHANNEL or "chromium",
+                "headless": BROWSER_HEADLESS,
+            }
+        finally:
+            await browser.close()
+
+
+def pincrux_probe_sync(account: AccountConfig, cookie_dir: str, url: str, reward_proxy_url: str = "", desktop: bool = False, log: Optional[Callable[[str], None]] = None) -> dict:
+    return _run_async_in_thread(lambda: pincrux_probe(account, cookie_dir, url, reward_proxy_url, desktop, log))
+
+
 async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_url: str = "", emit: Optional[Callable[[str], None]] = None):
     """저장된 쿠키로 네이버페이에 실제 접속해 로그인 상태를 확인한다. (state, detail) — state: alive / expired / terms(약관 미동의) / unknown"""
     from playwright.async_api import async_playwright
@@ -1264,7 +1322,7 @@ async def verify_session(account: AccountConfig, cookie_dir: str, reward_proxy_u
         proxy = playwright_proxy(reward_proxy_url)
         if proxy:
             launch_kwargs["proxy"] = proxy
-        browser = await playwright.chromium.launch(**launch_kwargs)
+        browser = await playwright.chromium.launch(**browser_launch_kwargs(launch_kwargs))
         try:
             context = await browser.new_context(
                 user_agent=IPHONE13_UA,
@@ -1458,7 +1516,7 @@ async def open_login_screen(account: AccountConfig, cookie_dir: str, proxy_url: 
         "has_touch": True,
     }
     persistent_kwargs.update(launch_kwargs)
-    context = await playwright.chromium.launch_persistent_context(profile_dir, **persistent_kwargs)
+    context = await playwright.chromium.launch_persistent_context(profile_dir, **browser_launch_kwargs(persistent_kwargs))
     page = context.pages[0] if context.pages else await context.new_page()
     await Stealth().apply_stealth_async(page)
     try:
@@ -1715,14 +1773,123 @@ async def click_and_dwell(page, locator, dwell_seconds: float, user_id: str, emi
 # ---------------------------------------------------------------------------
 PINCRUX_CLICK = True
 PINCRUX_WAIT_SECONDS = 5
+PINCRUX_DIAGNOSTIC = True  # 쇼핑라이브 대기 후 브라우저 환경/영상 재생 상태를 로그에 한 줄 남김
+
+# 브라우저 설정 (모든 브라우저 실행에 적용)
+#   BROWSER_CHANNEL   "" 이면 Playwright 내장 Chromium, "chrome"/"msedge" 면 설치된 실제 브라우저
+#   BROWSER_HEADLESS  False 면 화면이 있는 모드 (서버에서는 xvfb-run 필요)
+#   BROWSER_ARGS      추가 실행 인자
+BROWSER_CHANNEL = ""
+BROWSER_HEADLESS = True
+BROWSER_ARGS: list = []
 
 
-def configure_pincrux(click=None, wait_seconds=None):
-    global PINCRUX_CLICK, PINCRUX_WAIT_SECONDS
+def configure_pincrux(click=None, wait_seconds=None, diagnostic=None):
+    global PINCRUX_CLICK, PINCRUX_WAIT_SECONDS, PINCRUX_DIAGNOSTIC
     if click is not None:
         PINCRUX_CLICK = bool(click)
     if wait_seconds is not None:
         PINCRUX_WAIT_SECONDS = max(0, int(wait_seconds))
+    if diagnostic is not None:
+        PINCRUX_DIAGNOSTIC = bool(diagnostic)
+
+
+def configure_browser(channel=None, headless=None, args=None):
+    global BROWSER_CHANNEL, BROWSER_HEADLESS, BROWSER_ARGS
+    if channel is not None:
+        BROWSER_CHANNEL = str(channel).strip()
+    if headless is not None:
+        BROWSER_HEADLESS = bool(headless)
+    if args is not None:
+        BROWSER_ARGS = [str(a) for a in args if str(a).strip()]
+
+
+def browser_launch_kwargs(base: dict) -> dict:
+    """각 브라우저 실행 지점의 기본 인자에 공통 브라우저 설정(종류, 화면 유무, 추가 인자)을 덮어쓴다."""
+    kwargs = dict(base)
+    kwargs["headless"] = BROWSER_HEADLESS
+    if BROWSER_CHANNEL:
+        kwargs["channel"] = BROWSER_CHANNEL
+    args = list(kwargs.get("args") or [])
+    args += [a for a in BROWSER_ARGS if a not in args]
+    if args:
+        kwargs["args"] = args
+    return kwargs
+
+
+async def pincrux_env_report(page) -> dict:
+    """브라우저 환경과 영상 재생 상태 (쇼핑라이브 적립이 실제 크롬에서만 되는 이유를 찾기 위한 진단)."""
+    try:
+        return await page.evaluate(
+            r"""() => {
+                const probe = document.createElement('video');
+                const can = (t) => { try { return probe.canPlayType(t) || 'no'; } catch (e) { return 'err'; } };
+                const out = {
+                    ua: navigator.userAgent,
+                    webdriver: navigator.webdriver === true,
+                    chromeObj: typeof window.chrome,
+                    plugins: navigator.plugins ? navigator.plugins.length : null,
+                    languages: (navigator.languages || []).join(','),
+                    visibility: document.visibilityState,
+                    focus: document.hasFocus(),
+                    touch: 'ontouchstart' in window,
+                    h264: can('video/mp4; codecs="avc1.42E01E, mp4a.40.2"'),
+                    hls: can('application/vnd.apple.mpegurl'),
+                    videos: document.querySelectorAll('video').length,
+                };
+                const v = document.querySelector('video');
+                if (v) {
+                    let host = '';
+                    try { host = new URL(v.currentSrc).host; } catch (e) {}
+                    out.video = {
+                        paused: v.paused, muted: v.muted, t: Math.round(v.currentTime * 10) / 10,
+                        ready: v.readyState, net: v.networkState, srcHost: host,
+                        err: v.error ? (v.error.code + ':' + (v.error.message || '')) : null,
+                    };
+                }
+                return out;
+            }"""
+        )
+    except Exception as e:
+        return {"error": str(e)[:100]}
+
+
+def interpret_probe(report: dict) -> list:
+    """진단 결과에서 스크립트와 실제 크롬의 차이로 의심되는 점을 한국어로 알려 준다."""
+    hints = []
+    if not isinstance(report, dict) or not report:
+        return ["진단 정보를 읽지 못했습니다."]
+    if report.get("error"):
+        hints.append(f"진단 중 오류: {report['error']}")
+        return hints
+    ua = str(report.get("ua") or "")
+    if "HeadlessChrome" in ua:
+        hints.append("브라우저가 HeadlessChrome 으로 식별됩니다. 사이트가 자동화 브라우저로 판단할 수 있습니다 (browser_channel=chrome 권장).")
+    if report.get("webdriver"):
+        hints.append("navigator.webdriver 가 true 입니다 (자동화 흔적).")
+    if report.get("chromeObj") in ("undefined", None):
+        hints.append("window.chrome 객체가 없습니다 (실제 크롬과 다름).")
+    if report.get("h264") == "no":
+        hints.append("이 브라우저는 H.264 영상을 재생하지 못합니다. Playwright 내장 Chromium 에는 상용 코덱이 없어 영상이 재생되지 않을 수 있습니다 (browser_channel=chrome 권장).")
+    if report.get("visibility") not in (None, "visible"):
+        hints.append(f"페이지 상태가 {report.get('visibility')} 입니다. 보이지 않는 탭으로 취급되면 시청 시간이 인정되지 않을 수 있습니다.")
+    if report.get("focus") is False:
+        hints.append("페이지에 포커스가 없습니다.")
+    video = report.get("video")
+    if report.get("videos", 0) == 0 or video is None:
+        hints.append("화면에서 <video> 요소를 찾지 못했습니다 (영상이 다른 방식으로 재생되거나 아직 로딩 전일 수 있습니다).")
+    else:
+        if video.get("err"):
+            hints.append(f"영상 재생 오류: {video['err']} (코드 4는 형식/코덱 미지원).")
+        if video.get("paused"):
+            hints.append("영상이 일시정지 상태입니다. 자동재생이 막혔거나 재생이 시작되지 않았습니다.")
+        elif (video.get("t") or 0) <= 0:
+            hints.append("영상이 재생 중으로 표시되지만 재생 시간이 0 입니다 (로딩 실패 가능).")
+        if video.get("ready", 0) < 3 and not video.get("err"):
+            hints.append(f"영상 준비 상태(readyState)가 {video.get('ready')} 입니다 (충분히 로딩되지 않음).")
+    if not hints:
+        hints.append("뚜렷한 차이는 보이지 않습니다. 이 브라우저 환경은 실제 크롬과 비슷합니다.")
+    return hints
 
 
 async def pincrux_mouse_click(page, emit: Callable[[str], None], user_id: str) -> bool:
@@ -1792,6 +1959,8 @@ async def pincrux_dwell(page, required_seconds, fallback_dwell: float, emit: Cal
         await pincrux_mouse_click(page, emit, user_id)
     planned = fallback_dwell if PINCRUX_WAIT_SECONDS <= 0 else float(max(PINCRUX_WAIT_SECONDS, int(required_seconds or 1)))
     await asyncio.sleep(planned)
+    if PINCRUX_DIAGNOSTIC:
+        emit(f"{user_id}: pincrux env {json.dumps(await pincrux_env_report(page), ensure_ascii=False)}")
     return planned
 
 
@@ -2815,7 +2984,7 @@ async def process_account(
             proxy = playwright_proxy(reward_proxy_url)
             if proxy:
                 launch_kwargs["proxy"] = proxy
-            browser = await playwright.chromium.launch(**launch_kwargs)
+            browser = await playwright.chromium.launch(**browser_launch_kwargs(launch_kwargs))
             context = await browser.new_context(
                 user_agent=IPHONE13_UA,
                 viewport={"width": 390, "height": 844},
@@ -3019,7 +3188,7 @@ async def process_account_manual_link(
         proxy = playwright_proxy(reward_proxy_url)
         if proxy:
             launch_kwargs["proxy"] = proxy
-        browser = await playwright.chromium.launch(**launch_kwargs)
+        browser = await playwright.chromium.launch(**browser_launch_kwargs(launch_kwargs))
         context = await browser.new_context(
             user_agent=IPHONE13_UA,
             viewport={"width": 390, "height": 844},
@@ -3105,7 +3274,7 @@ async def fetch_with_playwright(url: str, proxy_url: str = "") -> str:
         proxy = playwright_proxy(proxy_url)
         if proxy:
             launch_kwargs["proxy"] = proxy
-        browser = await pw.chromium.launch(**launch_kwargs)
+        browser = await pw.chromium.launch(**browser_launch_kwargs(launch_kwargs))
         context = await browser.new_context(
             user_agent=IPHONE13_UA,
             locale="ko-KR",
@@ -3373,7 +3542,7 @@ async def process_damoang_url(url, soup, session, collected_urls, emit, proxy_ur
         launch_kwargs["proxy"] = proxy
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(**launch_kwargs)
+        browser = await pw.chromium.launch(**browser_launch_kwargs(launch_kwargs))
         context = await browser.new_context(
             user_agent=DESKTOP_UA,
             locale="ko-KR",
@@ -3451,7 +3620,7 @@ async def process_naverpay_point_main(
         launch_kwargs["proxy"] = proxy
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(**launch_kwargs)
+        browser = await pw.chromium.launch(**browser_launch_kwargs(launch_kwargs))
         context = await browser.new_context(
             user_agent=DESKTOP_UA,
             locale="ko-KR",
@@ -3520,7 +3689,7 @@ async def process_naverpay_mission_detail_source(
     emit(f"naverpay mission detail browser opening for {account.user_id} proxy={mask_proxy_url(reward_proxy_url)}")
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(**launch_kwargs)
+        browser = await pw.chromium.launch(**browser_launch_kwargs(launch_kwargs))
         context = await browser.new_context(
             user_agent=DESKTOP_UA,
             locale="ko-KR",

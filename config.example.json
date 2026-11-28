@@ -30,6 +30,10 @@
 
   "mcp_token": "",
 
+  "browser_channel": "",
+  "browser_headless": true,
+  "browser_args": [],
+  "pincrux_diagnostic": true,
   "pincrux_click": true,
   "pincrux_wait_seconds": 5,
 
